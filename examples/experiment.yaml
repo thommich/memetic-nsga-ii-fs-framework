@@ -1,0 +1,52 @@
+data:
+  path: synthetic.parquet
+  target: target
+  time_column: reference_month
+  id_column: applicant_id
+  allow_repeated_ids: false
+  segment_columns: [customer_type, age_group]
+model:
+  estimator: lightgbm
+  params:
+    min_data_in_leaf: 10
+    num_leaves: 15
+  num_boost_round: 25
+cross_validation:
+  strategy: expanding
+  min_train_months: 3
+  min_total_months: 6
+  validation_months: 1
+  step_months: 1
+  gap_months: 0
+optimization:
+  algorithm: memetic_nsga2
+  feature_range: [2, 12]
+  population_size: 12
+  max_generations: 8
+  min_generations: 4
+  patience: 5
+  use_rfe_initialization: true
+  rfe_seed_sizes: [2, 4, 8, 12]
+  local_search_interval: 4
+  local_search_budget: 16
+  random_state: 42
+evaluation:
+  metric: gini
+  use_sample_weights: false
+  row_sampling: false
+  feature_sampling: false
+  allow_reduced_fold_fidelity: true
+resources:
+  mode: auto
+  memory_reserve_fraction: 0.25
+  max_workers: 2
+  threads_per_worker: 2
+selection:
+  policy: tolerance
+  gini_tolerance: 0.005
+output:
+  format: parquet
+  experiment_dir: ../runs/example
+  checkpoints: true
+  interactive_plots: true
+  verbose: 1
