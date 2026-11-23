@@ -1,6 +1,21 @@
 # Verification record
 
-Verified locally on Windows, Python 3.14.6, on 2026-11-21:
+## Current API and example check — 2026-11-22
+
+- Full regression suite: **192 passed** after rebuilding the standalone module.
+- Checked the API reference against the selector constructor and every
+  configuration dataclass field; all public parameters are listed.
+- Validated `examples/complete_pipeline.ipynb` and parsed every code cell. Its
+  saved outputs were cleared because they belonged to the earlier selector
+  settings. Ran the new warm-up cell on a small synthetic frame, reviewed its
+  pilot tables, and loaded its YAML through `from_config()`. The revised
+  150,000-row notebook was not executed end to end.
+- Tested source-YAML preservation, inline override precedence, generated-YAML
+  fit/resume, and isolated standalone warm-up/config loading.
+
+## Earlier baseline — 2026-11-21
+
+Verified locally on Windows, Python 3.14.6:
 
 - Editable installation completed successfully.
 - Wheel and source distribution built with `python -m build`.

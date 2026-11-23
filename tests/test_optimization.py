@@ -218,6 +218,11 @@ class ProgressRecorder:
         self.records = []
     def info(self,message,**fields):
         self.records.append(("info",message,fields))
+    milestone = info
+    def generation(self, number):
+        pass
+    def generation_completed(self, number):
+        pass
     def debug(self,message,**fields):
         self.records.append(("debug",message,fields))
     def warning(self,message,**fields):
@@ -233,8 +238,8 @@ def test_progress_describes_generation_fidelity_and_local_search_without_changin
     result = engine.run()
     messages = [message for _,message,_ in evaluator.progress.records]
     assert messages[0] == "Optimization started"
-    assert "Initial population prepared" in messages
-    assert sum(message == "Generation started" for message in messages) == len(result["history"])
+    assert "Population initialization completed" in messages
+    assert sum(message.startswith("Running generation ") for message in messages) == len(result["history"])
     ends = [fields for _,message,fields in evaluator.progress.records if message == "Generation completed"]
     assert len(ends) == len(result["history"])
     assert all({"best_confirmed_gini","confirmed_hypervolume","confirmed_count","provisional_count",

@@ -164,7 +164,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         data = prepare_data(X, y, self.time_cv, id_col, segment_cols, self.allow_repeated_ids,
                             time_values, ids, feature_names)
         self._set_features(data)
-        self.progress_.info("Development data validated", phase="data", rows=data.n_rows,
+        self.progress_.milestone("Development data validated", phase="data", rows=data.n_rows,
                             predictors=data.n_features, categorical_features=len(data.categorical_indices),
                             observed_months=len(np.unique(data.months)))
         self.folds_ = build_folds(data.months, data.y, self.cv_config_, custom=self.time_cv if callable(self.time_cv) else None)
@@ -175,6 +175,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         self.progress_.info("Temporal folds validated", phase="cv", folds=len(self.folds_),
                             training_rows=[len(f.train) for f in self.folds_],
                             validation_rows=[len(f.valid) for f in self.folds_])
+        self.progress_.milestone("Temporal folds validated", folds=len(self.folds_))
         required_bytes = data.X.nbytes + data.y.nbytes + data.months.nbytes
         required_bytes += sum(f.train.nbytes + f.valid.nbytes for f in self.folds_)
         if shutil.disk_usage(self.directory_).free < required_bytes * 1.1 + 64 * 1024**2:
@@ -233,7 +234,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
 
     def _run(self, state=None):
         started = time.monotonic()
-        self.progress_.info("Starting feature subset search" if state is None else "Resuming feature subset search",
+        self.progress_.milestone("Starting feature subset search" if state is None else "Resuming feature subset search",
                             phase="optimization", generation=state["generation"] if state else 0,
                             population=self.optimization_.population_size,
                             max_generations=self.optimization_.max_generations,
@@ -242,6 +243,8 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
                                    random_state=self.random_state, use_rfe_initialization=self.use_rfe_initialization,
                                    initial_subsets=self.initial_subsets, feature_names=list(self.feature_names_in_),
                                    feature_groups=self.feature_groups)
+        self.progress_.start_generations(self.optimization_.max_generations,
+                                         completed=state["generation"] if state else 0)
         try:
             result = self.engine_.run(checkpoint_callback=self._checkpoint, state=state, cancel=self._cancel.is_set)
         except (KeyboardInterrupt, InterruptedError):
@@ -251,6 +254,8 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         except Exception as error:
             self.progress_.error("Feature subset search failed; completed evaluations remain cached", phase="optimization", error_type=type(error).__name__, reason=str(error))
             raise
+        finally:
+            self.progress_.finish_generations()
         self._state = result["state"]
         self.confirmed_ = result["confirmed"]
         self.provisional_ = result["provisional"]
@@ -267,13 +272,13 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             if selected_id is not None and any(r["key"] == selected_id for r in self.confirmed_):
                 self._select(selected_id)
             else:
-                self.progress_.info("Manual selection awaits a confirmed candidate ID", phase="selection",
+                self.progress_.milestone("Manual selection awaits a confirmed candidate ID", phase="selection",
                                     candidates=len(self.confirmed_))
         else:
             self._select()
         self._export()
         self.save_checkpoint()
-        self.progress_.info("Feature selection completed", phase="complete", stop_reason=self.stop_reason_,
+        self.progress_.milestone("Feature selection completed", phase="complete", stop_reason=self.stop_reason_,
                             confirmed_pareto_candidates=len(self.confirmed_), selected_features=len(self.best_features_ or []),
                             elapsed_seconds=round(time.monotonic() - started, 3), log=str(self.log_path_))
         self.progress_.close()
@@ -282,7 +287,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
     def _select(self, candidate_id=None):
         self.selected_candidate_ = select_candidate(self.confirmed_, self.selection_, self.random_state, candidate_id)
         self.best_features_ = self.feature_names_in_[np.asarray(self.selected_candidate_["mask"], bool)].tolist()
-        self.progress_.info("Final candidate selected", phase="selection", policy=self.selection_.policy,
+        self.progress_.milestone("Final candidate selected", phase="selection", policy=self.selection_.policy,
                             features=len(self.best_features_), mean_gini=self.selected_candidate_["mean_gini"],
                             candidate=self.selected_candidate_["key"][:12])
 
@@ -339,7 +344,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             settings["verbose"] = verbose
         selector = cls(**settings, checkpoint_dir=directory)
         selector._settings()
-        selector.progress_.info("Checkpoint inputs and dependency versions verified", phase="resume", directory=str(directory))
+        selector.progress_.milestone("Checkpoint inputs and dependency versions verified", phase="resume", directory=str(directory))
         data = load_dataset(directory / "data")
         selector._set_features(data)
         selector.folds_ = [Fold(np.load(directory / f["train"], mmap_mode="r"),
@@ -391,7 +396,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             raise ValueError("Select a candidate first")
         data = self.evaluator_.data
         started = time.monotonic()
-        self.progress_.info("Fitting final model on all development rows", phase="final_model", rows=len(data.y),
+        self.progress_.milestone("Fitting final model on all development rows", phase="final_model", rows=len(data.y),
                             features=len(self.best_features_), rounds=self.num_boost_round)
         cols = np.flatnonzero(self.get_support())
         cats = [i for i, col in enumerate(cols) if col in data.categorical_indices]
@@ -410,7 +415,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         self.final_model_.pandas_categorical = [data.categories[self.feature_names_in_[cols[i]]] for i in cats]
         self.final_model_.save_model(str(self.directory_ / "final_model.txt"))
         atomic_json(self.directory_ / "final_model_metadata.json", {"features": self.best_features_, "categories": data.categories, "parameters": params})
-        self.progress_.info("Final development model saved", phase="final_model", elapsed_seconds=round(time.monotonic() - started, 3))
+        self.progress_.milestone("Final development model saved", phase="final_model", elapsed_seconds=round(time.monotonic() - started, 3))
         self.progress_.close()
         return self.final_model_
 
@@ -437,4 +442,4 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         chosen = self.selected_candidate_ or self.reference_
         self.temporal_performance_ = pd.DataFrame(chosen["folds"])
         self.segment_performance_ = pd.DataFrame(chosen["segments"])
-        self.progress_.info("Result artifacts saved", phase="reporting", directory=str(self.directory_))
+        self.progress_.milestone("Result artifacts saved", phase="reporting", directory=str(self.directory_))

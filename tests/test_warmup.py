@@ -29,6 +29,9 @@ def test_quick_writes_separate_yaml_and_merges_inline_overrides(tmp_path, frame)
     result = warm(frame, tmp_path / "recommended.yaml", depth="quick", base_config=source)
     assert isinstance(result, WarmupResult)
     assert source.read_bytes() == original
+    with pytest.raises(ValueError, match="must differ"):
+        warm(frame, source, depth="quick", base_config=source, overwrite=True)
+    assert source.read_bytes() == original
     assert result.diagnostics["planned_fits"] == 0
     assert len(result.diagnostics["months"]) == 6
     assert result.suggestions["feature_range"] == [1, 8]
@@ -100,6 +103,9 @@ def test_from_config_accepts_existing_experiment_yaml_without_creating_run(tmp_p
         MemeticNSGA2Selector.from_config(path, nonexistent=1)
     with pytest.raises(ValueError, match="num_boost_round"):
         MemeticNSGA2Selector.from_config(path, num_boost_round=0)
+    invalid_source = tmp_path / "override.yaml"
+    invalid_source.write_text(path.read_text(encoding="utf-8").replace("num_boost_round: 20", "num_boost_round: 0"), encoding="utf-8")
+    assert MemeticNSGA2Selector.from_config(invalid_source, num_boost_round=4).num_boost_round == 4
 
 
 def test_generated_yaml_fit_and_resume(tmp_path, frame):

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Full-row temporal LightGBM feature selection with memetic NSGA-II"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26,<3", "pandas>=2.1,<4", "scikit-learn>=1.4,<2", "lightgbm>=4.5,<5", "pymoo>=0.6.2,<0.7", "joblib>=1.4,<2", "psutil>=6,<8", "pyarrow>=16", "plotly>=6,<7", "PyYAML>=6,<7", "threadpoolctl>=3"]
+dependencies = ["numpy>=1.26,<3", "pandas>=2.1,<4", "scikit-learn>=1.4,<2", "lightgbm>=4.5,<5", "pymoo>=0.6.2,<0.7", "joblib>=1.4,<2", "psutil>=6,<8", "pyarrow>=16", "plotly>=6,<7", "PyYAML>=6,<7", "threadpoolctl>=3", "tqdm>=4.66,<5"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build", "nbformat", "nbclient", "ipykernel"]

@@ -7,6 +7,12 @@ The Python entry point is `MemeticNSGA2Selector`. Typed dataclasses group CV,
 optimization, evaluation, execution and selection settings. YAML maps to the same
 objects, rejects unknown keys, and never imports executable callables.
 
+The optional `warmup_settings_params()` entry point validates development data,
+builds the same temporal folds, inspects resources, and compares fixed LightGBM
+settings at the selected depth. It writes separate selector-only YAML and returns
+pilot diagnostics. `from_config()` resolves that file or a full experiment YAML
+before `fit`; it does not start a run.
+
 `data` validates once, excludes metadata and persists read-only arrays. `cv`
 materializes full-month folds before training. `evaluation` trains fixed-round
 CPU LightGBM models and writes compact metrics transactionally. `optimization`
@@ -25,7 +31,8 @@ Scope decisions: windows count observed months, not uninterrupted calendar
 history; overlapping validation windows and temporal gaps are rejected in v1.
 Statistical selection uses paired temporal block resampling of fold Gini
 differences; few folds imply weak uncertainty estimates. No distributed backend,
-external OOT input, feature engineering, or hyperparameter optimization is added.
+external OOT input or feature engineering is added. Warm-up compares a fixed,
+finite set of model settings; it does not optimize LightGBM jointly with NSGA-II.
 
 API verification (2026-11-21): pymoo 0.6.2, LightGBM 4.7.0,
 joblib 1.6.0, psutil 7.2.2. Sources:

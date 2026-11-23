@@ -55,7 +55,7 @@ undefined AUC is represented by null and never enters optimizer constraints.
 `resources='auto'` uses these defaults. Limits also honor current available RAM,
 CPU affinity and cgroup restrictions. User limits cannot enable oversubscription.
 
-`verbose=1` provides concise timestamped progress; 2 includes each candidate/fold,
+`verbose=1` provides milestones and a generation bar with worker status; 2 includes each candidate/fold,
 and 0 keeps warnings/errors on the built-in console. Detailed per-process files
 are retained under `logs/` at every verbosity. YAML uses `output.verbose` and CLI
 supports `--verbose` / `--quiet`. Long fits emit periodic heartbeats. See

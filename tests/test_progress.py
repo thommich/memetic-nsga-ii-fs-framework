@@ -9,17 +9,20 @@ from memetic_fs.progress import ProgressReporter, progress_from_descriptor, prog
 def test_console_verbosity_and_detailed_file_output(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(logging.getLogger(), "handlers", [])
     reporter = ProgressReporter(tmp_path, verbose=1)
-    reporter.info("Generation completed", generation=3, best_confirmed_gini=.71)
+    reporter.milestone("Generation completed", generation=3, best_confirmed_gini=.71)
+    reporter.info("Evaluation batch prepared", requested_candidates=8)
     reporter.debug("Temporal fold started", train_n=1000, validation_n=200)
     console = capsys.readouterr().err
     assert "Generation completed" in console and "generation=3" in console
     assert "Temporal fold started" not in console
+    assert "Evaluation batch prepared" not in console
     output = reporter.path.read_text(encoding="utf-8")
     assert "Generation completed" in output and "Temporal fold started" in output
+    assert "Evaluation batch prepared" in output
     assert "train_n=1000" in output and "validation_n=200" in output
     assert "Z INFO pid=" in output
     reporter.close()
-    reporter.info("Resume completed")
+    reporter.milestone("Resume completed")
     reporter.close()
     assert "Resume completed" in reporter.path.read_text(encoding="utf-8")
 
@@ -41,12 +44,48 @@ def test_existing_application_logging_receives_structured_records_without_duplic
     monkeypatch.setattr(logging.getLogger(), "handlers", [Capture()])
     monkeypatch.setattr(logging.getLogger(), "level", logging.INFO)
     reporter = ProgressReporter(tmp_path, verbose=1)
-    reporter.info("Model batch complete", cache_hits=4, unique=7)
+    reporter.milestone("Model batch complete", cache_hits=4, unique=7)
+    reporter.info("Routine batch detail", tasks=7)
     reporter.debug("Detailed internal state")
     assert len(records) == 1
     assert records[0].progress_fields == {"cache_hits":4, "unique":7}
     assert "cache_hits=4" in records[0].getMessage()
     assert not capsys.readouterr().err
+    assert "Routine batch detail" in reporter.path.read_text(encoding="utf-8")
+    reporter.close()
+
+
+def test_generation_bar_updates_worker_counts_and_closes(tmp_path, monkeypatch):
+    from memetic_fs import progress as progress_module
+
+    bars = []
+    class Bar:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.n = kwargs["initial"]
+            self.postfix = None
+            self.closed = False
+            bars.append(self)
+        def set_description_str(self, value):
+            self.description = value
+        def set_postfix(self, value, refresh=True):
+            self.postfix = value.copy()
+        def update(self, amount):
+            self.n += amount
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(progress_module, "tqdm", Bar)
+    reporter = ProgressReporter(tmp_path, verbose=1)
+    reporter.start_generations(5, completed=2)
+    reporter.generation(3)
+    reporter.worker_status(total=4, running=2, completed=1, failed=1)
+    reporter.generation_completed(3)
+    reporter.finish_generations()
+    assert bars[0].description == "Running generation 3/5"
+    assert bars[0].n == 3
+    assert bars[0].postfix == {"workers_total": 4, "running": 2, "completed": 1, "failed": 1}
+    assert bars[0].closed
     reporter.close()
 
 def test_descriptors_reconstruct_worker_specific_file_and_validate_verbosity(tmp_path):
