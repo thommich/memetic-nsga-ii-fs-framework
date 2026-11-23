@@ -39,9 +39,9 @@ chronological fold order. The table contains these columns:
 
 The selected candidate always has full-CV metrics; provisional reduced-fold
 results are not used for this table. Each accepted fold contains both target
-classes, so its AUC and Gini are defined. The saved
-The saved `fold_performance` table covers **all evaluated candidates** and
-add `key` and `fidelity`; they are not the same single-candidate view as this
+classes, so its AUC and Gini are defined. The saved `fold_performance` table
+covers **all evaluated candidates** and adds `key` and `fidelity`; it is not
+the same single-candidate view as this
 attribute.
 
 ## `selector.segment_performance_`

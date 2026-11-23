@@ -18,6 +18,8 @@ import time
 import threading
 from typing import Any
 
+from tqdm.auto import tqdm
+
 
 class _ProgressFormatter(logging.Formatter):
     converter = time.gmtime
@@ -38,8 +40,8 @@ def _ancestor_has_output(logger: logging.Logger) -> bool:
 class ProgressReporter:
     """Per-experiment progress logger, safe for notebooks and reusable workers.
 
-    ``verbose=0`` shows warnings/errors, 1 shows phase/batch/generation progress,
-    and 2 additionally shows each candidate, fold and cache lookup. The files
+    ``verbose=0`` shows warnings/errors, 1 shows milestones and a generation bar,
+    and 2 additionally shows routine progress and candidate/fold detail. The files
     retain DEBUG details regardless of console verbosity. Existing ancestor
     logging handlers receive records; an extra console handler is added only
     when the application has not configured logging already.
@@ -51,6 +53,8 @@ class ProgressReporter:
         self.directory = Path(directory).resolve()
         self.verbose = verbose
         self.parent_pid = os.getpid() if parent_pid is None else parent_pid
+        self._bar = None
+        self._worker_status = {"workers_total": 0, "running": 0, "completed": 0, "failed": 0}
         logs = self.directory / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         process = os.getpid()
@@ -68,7 +72,7 @@ class ProgressReporter:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
         console = [handler for handler in self.logger.handlers if getattr(handler, "_memetic_console", False)]
-        if not _ancestor_has_output(self.logger) and not console:
+        if process == self.parent_pid and not _ancestor_has_output(self.logger) and not console:
             handler = logging.StreamHandler()
             handler._memetic_console = True
             handler.setFormatter(formatter)
@@ -83,28 +87,63 @@ class ProgressReporter:
         """Small serializable worker settings, containing no data or handlers."""
         return {"directory": str(self.directory), "verbose": self.verbose, "parent_pid": self.parent_pid}
 
-    def _emit(self, level: int, message: str, fields: dict[str, Any]) -> None:
+    def _emit(self, level: int, message: str, fields: dict[str, Any], *, screen: bool = True) -> None:
         if fields:
             message += " | " + " ".join(f"{key}={json.dumps(value, default=str, ensure_ascii=True)}" for key, value in sorted(fields.items()))
         # Parent logger levels are not automatically applied to propagated
         # records. Keep DEBUG detail in our files without flooding an existing
         # application's INFO console handler.
-        if _ancestor_has_output(self.logger) and level < logging.getLogger("memetic_fs").getEffectiveLevel():
+        process_is_worker = os.getpid() != self.parent_pid
+        if (not screen or process_is_worker
+                or (_ancestor_has_output(self.logger) and level < logging.getLogger("memetic_fs").getEffectiveLevel())):
             record = self.logger.makeRecord(self.logger.name, level, __file__, 0, message, (), None,
                                             extra={"progress_fields": fields})
             for handler in self.logger.handlers:
-                if level >= handler.level:
+                if level >= handler.level and (screen and not process_is_worker or getattr(handler, "_memetic_file", False)):
                     handler.handle(record)
             return
         self.logger.log(level, message, extra={"progress_fields": fields})
 
     def info(self, message: str, **fields: Any) -> None:
-        """Record phase, batch or generation progress."""
-        self._emit(logging.INFO, message, fields)
+        """Record routine progress in files and at console verbosity 2."""
+        self._emit(logging.INFO, message, fields, screen=self.verbose == 2)
+
+    def milestone(self, message: str, **fields: Any) -> None:
+        """Show a concise milestone at verbosity 1 or 2."""
+        self._emit(logging.INFO, message, fields, screen=self.verbose > 0)
 
     def debug(self, message: str, **fields: Any) -> None:
         """Record detailed candidate, fold or cache progress."""
-        self._emit(logging.DEBUG, message, fields)
+        self._emit(logging.DEBUG, message, fields, screen=self.verbose == 2)
+
+    def start_generations(self, total: int, completed: int = 0) -> None:
+        if self.verbose == 1 and os.getpid() == self.parent_pid:
+            self._bar = tqdm(total=total, initial=completed, desc="Generations", unit="gen",
+                             dynamic_ncols=True, leave=True)
+            self._refresh_bar()
+
+    def generation(self, number: int) -> None:
+        if self._bar is not None:
+            self._bar.set_description_str(f"Running generation {number}/{self._bar.total}")
+            self._refresh_bar()
+
+    def generation_completed(self, number: int) -> None:
+        if self._bar is not None:
+            self._bar.update(max(0, number - self._bar.n))
+            self._refresh_bar()
+
+    def worker_status(self, total: int, running: int, completed: int, failed: int) -> None:
+        self._worker_status = dict(workers_total=total, running=running, completed=completed, failed=failed)
+        self._refresh_bar()
+
+    def _refresh_bar(self) -> None:
+        if self._bar is not None:
+            self._bar.set_postfix(self._worker_status, refresh=True)
+
+    def finish_generations(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
 
     def warning(self, message: str, **fields: Any) -> None:
         """Record operational warnings and recoverable failures."""
@@ -129,8 +168,16 @@ class _NullProgress:
         pass
 
     debug = info
+    milestone = info
     warning = info
     error = info
+    def start_generations(self, *args: Any, **fields: Any) -> None:
+        pass
+
+    generation = start_generations
+    generation_completed = start_generations
+    worker_status = start_generations
+    finish_generations = start_generations
 
     def close(self) -> None:
         pass

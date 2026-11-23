@@ -4,8 +4,9 @@ This reference covers the exported selector and configuration classes, their pub
 methods, and the notebook and reporting helpers exposed by
 `memetic_fs_standalone.py`. Import the selector and configuration classes from
 `memetic_fs` (or the standalone module). Calls use **development data only**.
-Defaults below are the values in the Python API; a YAML configuration maps to
-these same settings through the CLI.
+Defaults below are the values in the Python API. Full experiment YAML maps to
+them through the CLI or `from_config()`; warm-up writes selector-only YAML for
+`from_config()`.
 
 ## `MemeticNSGA2Selector(...)`
 
@@ -33,7 +34,7 @@ search begin when `fit` is called. All parameters are optional.
 | `feature_groups` | `None` | Optional mapping of predictor name to family label, or family label to a collection of predictor names/positions. It guides some structured swaps and groups feature-frequency reports. Use the name-to-family form for simple reporting and search. |
 | `interactive_plots` | `True` | Boolean controlling self-contained interactive Plotly output in `report.html`. Tabular result files are still exported. |
 | `output_format` | `"parquet"` | File format for each exported result table: `"csv"`, `"json"`, or `"parquet"`. Only the chosen format is written for each table. Structured JSON records for checkpoints and report rebuilding remain available. YAML uses `output.format`. |
-| `verbose` | `1` | Console progress level: `0` warnings/errors, `1` phase and generation updates, `2` candidate/fold detail. Detailed log files are retained at every level. |
+| `verbose` | `1` | Console progress level: `0` warnings/errors, `1` milestones and a generation bar with worker counts, `2` routine batch and candidate/fold detail. Detailed log files are retained at every level. |
 
 Configuration groups may be passed as dataclass instances or dictionaries;
 unknown dictionary keys raise an error.
@@ -64,15 +65,20 @@ segment_cols=None, time_values=None, ids=None, feature_names=None,
 time_cv=None)` returns a `WarmupResult` and writes separate selector-settings
 YAML. It validates data and folds but does not run the NSGA-II search. `quick`
 uses no model fits, `standard` pilots the last three folds, and `deep` uses all
-folds. Pilot duration grows with data size and depth. For a YAML warm-up,
-`time_cv` must be a column name. An existing `output_path` raises unless
-`overwrite=True`.
+folds. Pilot duration grows with data size and depth; there is no duration or
+fit-count cutoff within a selected depth. `quick` model suggestions are
+heuristic. For a YAML warm-up, `time_cv` must be a column name. An existing
+`output_path` raises unless `overwrite=True`, and `output_path` cannot equal
+`base_config`.
 
 `MemeticNSGA2Selector.from_config(path, **overrides)` loads either a flat
 selector-settings YAML or a full CLI experiment YAML. Inline overrides take
 priority, including individual keys inside `model_params`, `cv_config`,
 `optimization`, `evaluation`, `resources`, and `selection`. Unknown and invalid
-values are rejected before `fit`.
+settings that do not require data are rejected before `fit`. Data-dependent
+checks, such as subset names and available predictor count, run during warm-up
+or `fit`. A selector resolves the file once; `resume()` uses the effective
+settings in the run manifest.
 
 | Call and parameter | Description |
 | --- | --- |

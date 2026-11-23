@@ -345,6 +345,9 @@ def test_evaluator_reports_fold_cache_and_duplicate_progress(inputs, tmp_path, m
             self.events = []
         def info(self, message, **fields):
             self.events.append(("info", message, fields))
+        milestone = info
+        def worker_status(self, **fields):
+            self.events.append(("workers", "Worker status", fields))
         def debug(self, message, **fields):
             self.events.append(("debug", message, fields))
         def warning(self, message, **fields):
