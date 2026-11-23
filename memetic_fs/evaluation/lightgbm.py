@@ -295,11 +295,11 @@ class Evaluator:
                            excluded_constraints=len(self.excluded_constraints))
         self.scheduler = ResourceScheduler(self.manager, cancelled=cancelled, progress=self.progress)
         calibration_started = time.perf_counter()
-        self.progress.info("Full-feature reference calibration started", n_features=self.data.X.shape[1],
+        self.progress.milestone("Full-feature reference calibration started", n_features=self.data.X.shape[1],
                            folds=len(self.fold_specs), num_boost_round=self.num_boost_round)
         self.reference = self.evaluate_many([np.ones(self.data.X.shape[1], dtype=bool)], "full", reference=True)[0]
         self.manager.calibrate(self.reference["memory_peak_bytes"])
-        self.progress.info("Full-feature reference calibration completed", mean_gini=self.reference["mean_gini"],
+        self.progress.milestone("Full-feature reference calibration completed", mean_gini=self.reference["mean_gini"],
                            measured_private_peak_bytes=self.reference["memory_peak_bytes"],
                            estimated_task_bytes=self.manager.estimated_task_bytes,
                            elapsed_seconds=time.perf_counter() - calibration_started)

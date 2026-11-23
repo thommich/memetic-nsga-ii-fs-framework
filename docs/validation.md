@@ -10,6 +10,10 @@ every row in its interval. The final interval always ends in the maximum
 observed development month. A final window may shift to end there when the
 configured step otherwise misses the tail; overlapping windows are rejected.
 
+Optional warm-up reuses these data and fold checks. Its model pilots fit every
+training row and score every validation row in the chosen folds; feature
+rankings for each subset probe come only from that fold's training model.
+
 Custom protocol:
 
 ```python

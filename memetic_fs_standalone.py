@@ -851,6 +851,8 @@ import time
 import threading
 from typing import Any
 
+from tqdm.auto import tqdm
+
 
 class _ProgressFormatter(logging.Formatter):
     converter = time.gmtime
@@ -871,8 +873,8 @@ def _ancestor_has_output(logger: logging.Logger) -> bool:
 class ProgressReporter:
     """Per-experiment progress logger, safe for notebooks and reusable workers.
 
-    ``verbose=0`` shows warnings/errors, 1 shows phase/batch/generation progress,
-    and 2 additionally shows each candidate, fold and cache lookup. The files
+    ``verbose=0`` shows warnings/errors, 1 shows milestones and a generation bar,
+    and 2 additionally shows routine progress and candidate/fold detail. The files
     retain DEBUG details regardless of console verbosity. Existing ancestor
     logging handlers receive records; an extra console handler is added only
     when the application has not configured logging already.
@@ -884,6 +886,8 @@ class ProgressReporter:
         self.directory = Path(directory).resolve()
         self.verbose = verbose
         self.parent_pid = os.getpid() if parent_pid is None else parent_pid
+        self._bar = None
+        self._worker_status = {"workers_total": 0, "running": 0, "completed": 0, "failed": 0}
         logs = self.directory / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         process = os.getpid()
@@ -901,7 +905,7 @@ class ProgressReporter:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
         console = [handler for handler in self.logger.handlers if getattr(handler, "_memetic_console", False)]
-        if not _ancestor_has_output(self.logger) and not console:
+        if process == self.parent_pid and not _ancestor_has_output(self.logger) and not console:
             handler = logging.StreamHandler()
             handler._memetic_console = True
             handler.setFormatter(formatter)
@@ -916,28 +920,63 @@ class ProgressReporter:
         """Small serializable worker settings, containing no data or handlers."""
         return {"directory": str(self.directory), "verbose": self.verbose, "parent_pid": self.parent_pid}
 
-    def _emit(self, level: int, message: str, fields: dict[str, Any]) -> None:
+    def _emit(self, level: int, message: str, fields: dict[str, Any], *, screen: bool = True) -> None:
         if fields:
             message += " | " + " ".join(f"{key}={json.dumps(value, default=str, ensure_ascii=True)}" for key, value in sorted(fields.items()))
         # Parent logger levels are not automatically applied to propagated
         # records. Keep DEBUG detail in our files without flooding an existing
         # application's INFO console handler.
-        if _ancestor_has_output(self.logger) and level < logging.getLogger("memetic_fs").getEffectiveLevel():
+        process_is_worker = os.getpid() != self.parent_pid
+        if (not screen or process_is_worker
+                or (_ancestor_has_output(self.logger) and level < logging.getLogger("memetic_fs").getEffectiveLevel())):
             record = self.logger.makeRecord(self.logger.name, level, __file__, 0, message, (), None,
                                             extra={"progress_fields": fields})
             for handler in self.logger.handlers:
-                if level >= handler.level:
+                if level >= handler.level and (screen and not process_is_worker or getattr(handler, "_memetic_file", False)):
                     handler.handle(record)
             return
         self.logger.log(level, message, extra={"progress_fields": fields})
 
     def info(self, message: str, **fields: Any) -> None:
-        """Record phase, batch or generation progress."""
-        self._emit(logging.INFO, message, fields)
+        """Record routine progress in files and at console verbosity 2."""
+        self._emit(logging.INFO, message, fields, screen=self.verbose == 2)
+
+    def milestone(self, message: str, **fields: Any) -> None:
+        """Show a concise milestone at verbosity 1 or 2."""
+        self._emit(logging.INFO, message, fields, screen=self.verbose > 0)
 
     def debug(self, message: str, **fields: Any) -> None:
         """Record detailed candidate, fold or cache progress."""
-        self._emit(logging.DEBUG, message, fields)
+        self._emit(logging.DEBUG, message, fields, screen=self.verbose == 2)
+
+    def start_generations(self, total: int, completed: int = 0) -> None:
+        if self.verbose == 1 and os.getpid() == self.parent_pid:
+            self._bar = tqdm(total=total, initial=completed, desc="Generations", unit="gen",
+                             dynamic_ncols=True, leave=True)
+            self._refresh_bar()
+
+    def generation(self, number: int) -> None:
+        if self._bar is not None:
+            self._bar.set_description_str(f"Running generation {number}/{self._bar.total}")
+            self._refresh_bar()
+
+    def generation_completed(self, number: int) -> None:
+        if self._bar is not None:
+            self._bar.update(max(0, number - self._bar.n))
+            self._refresh_bar()
+
+    def worker_status(self, total: int, running: int, completed: int, failed: int) -> None:
+        self._worker_status = dict(workers_total=total, running=running, completed=completed, failed=failed)
+        self._refresh_bar()
+
+    def _refresh_bar(self) -> None:
+        if self._bar is not None:
+            self._bar.set_postfix(self._worker_status, refresh=True)
+
+    def finish_generations(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
 
     def warning(self, message: str, **fields: Any) -> None:
         """Record operational warnings and recoverable failures."""
@@ -962,8 +1001,16 @@ class _NullProgress:
         pass
 
     debug = info
+    milestone = info
     warning = info
     error = info
+    def start_generations(self, *args: Any, **fields: Any) -> None:
+        pass
+
+    generation = start_generations
+    generation_completed = start_generations
+    worker_status = start_generations
+    finish_generations = start_generations
 
     def close(self) -> None:
         pass
@@ -1019,6 +1066,7 @@ def progress_activity(reporter, message: str, interval_seconds: float = 30, **fi
 
 import logging
 import time
+from concurrent.futures import as_completed
 from typing import Callable, Iterable, TypeVar
 
 from joblib.externals.loky import get_reusable_executor
@@ -1086,9 +1134,15 @@ class ResourceScheduler:
                                threads_per_worker=plan.threads_per_worker, completed_tasks=cursor,
                                total_tasks=len(task_list), memory_budget_bytes=plan.memory_budget_bytes,
                                estimated_task_bytes=plan.estimated_task_bytes)
+            self.progress.worker_status(total=len(batch), running=len(batch), completed=0, failed=0)
             try:
                 if workers == 1:
-                    batch_results = [_limited_call(fn, task, plan.threads_per_worker) for task in batch]
+                    try:
+                        batch_results = [_limited_call(fn, batch[0], plan.threads_per_worker)]
+                    except BaseException:
+                        self.progress.worker_status(total=1, running=0, completed=0, failed=1)
+                        raise
+                    self.progress.worker_status(total=1, running=0, completed=1, failed=0)
                 else:
                     # Descriptors contain paths, not matrices. Using loky
                     # directly avoids creating redundant joblib temporary
@@ -1099,17 +1153,23 @@ class ResourceScheduler:
                                     "NUMEXPR_NUM_THREADS")}
                     executor = get_reusable_executor(max_workers=workers, timeout=300, env=environment)
                     futures = [executor.submit(_limited_call, fn, task, plan.threads_per_worker) for task in batch]
-                    batch_results, errors = [], []
+                    batch_results, errors = [None] * len(futures), []
+                    completed, failed = 0, 0
                     try:
                         # Drain the bounded batch before retrying: surviving
                         # workers can commit their completed cache records.
                         with progress_activity(self.progress, "Model batch still running", workers=workers,
                                                completed_tasks=cursor, total_tasks=len(task_list)):
-                            for future in futures:
+                            positions = {future: index for index, future in enumerate(futures)}
+                            for future in as_completed(futures):
                                 try:
-                                    batch_results.append(future.result())
+                                    batch_results[positions[future]] = future.result()
+                                    completed += 1
                                 except Exception as error:
                                     errors.append(error)
+                                    failed += 1
+                                self.progress.worker_status(total=len(batch),
+                                    running=len(batch)-completed-failed, completed=completed, failed=failed)
                         if errors:
                             raise errors[0]
                     except BaseException:
@@ -1592,11 +1652,11 @@ class Evaluator:
                            excluded_constraints=len(self.excluded_constraints))
         self.scheduler = ResourceScheduler(self.manager, cancelled=cancelled, progress=self.progress)
         calibration_started = time.perf_counter()
-        self.progress.info("Full-feature reference calibration started", n_features=self.data.X.shape[1],
+        self.progress.milestone("Full-feature reference calibration started", n_features=self.data.X.shape[1],
                            folds=len(self.fold_specs), num_boost_round=self.num_boost_round)
         self.reference = self.evaluate_many([np.ones(self.data.X.shape[1], dtype=bool)], "full", reference=True)[0]
         self.manager.calibrate(self.reference["memory_peak_bytes"])
-        self.progress.info("Full-feature reference calibration completed", mean_gini=self.reference["mean_gini"],
+        self.progress.milestone("Full-feature reference calibration completed", mean_gini=self.reference["mean_gini"],
                            measured_private_peak_bytes=self.reference["memory_peak_bytes"],
                            estimated_task_bytes=self.manager.estimated_task_bytes,
                            elapsed_seconds=time.perf_counter() - calibration_started)
@@ -1867,7 +1927,7 @@ def rfe_seeds(evaluator, n_features, bounds, sizes):
     seeds, trajectory = [], []
     progress = get_progress(evaluator)
     started = time.perf_counter()
-    progress.info("RFE initialization started", targets=targets, initial_features=n_features)
+    progress.milestone("RFE initialization started", targets=targets, initial_features=n_features)
     for target in targets:
         progress.info("RFE target started", target_features=target, current_features=int(current.sum()))
         while current.sum() > target:
@@ -1889,7 +1949,7 @@ def rfe_seeds(evaluator, n_features, bounds, sizes):
         if not trajectory or trajectory[-1]["mask"] != evaluation["mask"]:
             trajectory.append(evaluation)
         progress.info("RFE target completed", target_features=target, mean_gini=evaluation["mean_gini"])
-    progress.info("RFE initialization completed", seeds=len(seeds), evaluation_steps=len(trajectory),
+    progress.milestone("RFE initialization completed", seeds=len(seeds), evaluation_steps=len(trajectory),
                   elapsed_seconds=time.perf_counter()-started)
     return seeds, trajectory
 
@@ -2229,18 +2289,18 @@ class SearchEngine:
     def run(self, checkpoint_callback: Callable | None = None, state=None, cancel=None):
         """Execute until confirmed-front convergence, safety limit, or cancellation."""
         self._run_started = time.perf_counter()
-        self.progress.info("Optimization started", max_generations=self.config.max_generations,
+        self.progress.milestone("Optimization started", max_generations=self.config.max_generations,
                            population_size=self.config.population_size, candidate_features=self.n_features,
                            min_features=self.bounds[0], max_features=self.bounds[1],
                            resuming=state is not None)
         if state is not None:
             self._restore(state)
-            self.progress.info("Optimization checkpoint restored", completed_generation=state["generation"],
+            self.progress.milestone("Optimization checkpoint restored", completed_generation=state["generation"],
                                population_size=len(self.algorithm.pop), fidelity=state["fidelity"],
                                completed_evaluations=len(self.results),
                                confirmed_count=len(self._front("full")))
             if state.get("stop_reason") in {"pareto_convergence", "search_space_exhausted"}:
-                self.progress.info("Optimization already completed; retaining checkpoint result",
+                self.progress.milestone("Optimization already completed; retaining checkpoint result",
                                    reason=state["stop_reason"], completed_generation=state["generation"])
                 return self._result(state["stop_reason"])
             start = state["generation"] + 1
@@ -2263,7 +2323,7 @@ class SearchEngine:
             sampling = initial_population(self.n_features, self.bounds, self.config.population_size,
                 self.rng, self.config, self.evaluator.reference["importance"], self.user_seeds, rfe, self.groups)
             cardinalities = sampling.sum(axis=1)
-            self.progress.info("Initial population prepared", user_seeds=len(self.user_seeds),
+            self.progress.milestone("Population initialization completed", user_seeds=len(self.user_seeds),
                                rfe_seeds=len(rfe), unique_candidates=len(sampling),
                                min_features=int(cardinalities.min()), mean_features=float(cardinalities.mean()),
                                max_features=int(cardinalities.max()))
@@ -2286,9 +2346,11 @@ class SearchEngine:
                     break
                 fidelity = f"last_{self.config.reduced_fold_count}" if generation <= self.config.reduced_generations else "full"
                 generation_started = time.perf_counter()
+                self.progress.generation(generation)
                 self.progress.info("Generation started", generation=generation,
                                    max_generations=self.config.max_generations, fidelity=fidelity,
                                    phase="initial_population" if not self.algorithm.is_initialized else "offspring")
+                self.progress.milestone(f"Running generation {generation}", fidelity=fidelity)
                 self.problem.fidelity = fidelity
                 if previous_fidelity is not None and previous_fidelity != fidelity:
                     # Existing parents and new offspring must share one fitness basis.
@@ -2328,7 +2390,7 @@ class SearchEngine:
                 if generation >= self.config.min_generations and stalled >= self.config.patience:
                     stop_reason = "pareto_convergence"
                     self.history[-1]["converged"] = True
-                    self.progress.info("Confirmed Pareto frontier converged", generation=generation,
+                    self.progress.milestone("Confirmed Pareto frontier converged", generation=generation,
                                        stalled_generations=stalled, patience=self.config.patience,
                                        minimum_improvement=self.config.min_improvement,
                                        confirmed_hypervolume=hypervolume)
@@ -2341,6 +2403,10 @@ class SearchEngine:
                                    max_features=int(counts.max()), stalled_generations=stalled,
                                    generation_seconds=time.perf_counter()-generation_started,
                                    elapsed_seconds=time.perf_counter()-self._run_started)
+                self.progress.generation_completed(generation)
+                self.progress.milestone(f"Generation {generation} completed",
+                                        best_confirmed_gini=self.history[-1]["best_confirmed_gini"],
+                                        confirmed_hypervolume=hypervolume)
                 checkpoint_reason = "running" if stop_reason == "max_generations" and generation < self.config.max_generations else stop_reason
                 self.last_state = self._serialize(generation, best_hv, stalled, fidelity, checkpoint_reason)
                 if checkpoint_callback:
@@ -2368,7 +2434,7 @@ class SearchEngine:
             raise
         if self.algorithm.pop is not None and len(self.algorithm.pop):
             # Always confirm every survivor, including infeasible provisional candidates.
-            self.progress.info("Final population confirmation started", candidates=len(self.algorithm.pop),
+            self.progress.milestone("Final population confirmation started", candidates=len(self.algorithm.pop),
                                fidelity="full")
             self._evaluate(self.algorithm.pop.get("X"), "full")
             self._confirm(fidelity)
@@ -2385,7 +2451,7 @@ class SearchEngine:
 
     def _result(self, stop_reason):
         front = self._front("full")
-        self.progress.info("Optimization completed", reason=stop_reason,
+        self.progress.milestone("Optimization completed", reason=stop_reason,
                            completed_generation=self.last_state["generation"] if self.last_state else 0,
                            confirmed_count=len(front), unique_evaluations=len(self.results),
                            best_confirmed_gini=max((result["mean_gini"] for result in front),default=None),
@@ -2616,7 +2682,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         data = prepare_data(X, y, self.time_cv, id_col, segment_cols, self.allow_repeated_ids,
                             time_values, ids, feature_names)
         self._set_features(data)
-        self.progress_.info("Development data validated", phase="data", rows=data.n_rows,
+        self.progress_.milestone("Development data validated", phase="data", rows=data.n_rows,
                             predictors=data.n_features, categorical_features=len(data.categorical_indices),
                             observed_months=len(np.unique(data.months)))
         self.folds_ = build_folds(data.months, data.y, self.cv_config_, custom=self.time_cv if callable(self.time_cv) else None)
@@ -2627,6 +2693,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         self.progress_.info("Temporal folds validated", phase="cv", folds=len(self.folds_),
                             training_rows=[len(f.train) for f in self.folds_],
                             validation_rows=[len(f.valid) for f in self.folds_])
+        self.progress_.milestone("Temporal folds validated", folds=len(self.folds_))
         required_bytes = data.X.nbytes + data.y.nbytes + data.months.nbytes
         required_bytes += sum(f.train.nbytes + f.valid.nbytes for f in self.folds_)
         if shutil.disk_usage(self.directory_).free < required_bytes * 1.1 + 64 * 1024**2:
@@ -2685,7 +2752,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
 
     def _run(self, state=None):
         started = time.monotonic()
-        self.progress_.info("Starting feature subset search" if state is None else "Resuming feature subset search",
+        self.progress_.milestone("Starting feature subset search" if state is None else "Resuming feature subset search",
                             phase="optimization", generation=state["generation"] if state else 0,
                             population=self.optimization_.population_size,
                             max_generations=self.optimization_.max_generations,
@@ -2694,6 +2761,8 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
                                    random_state=self.random_state, use_rfe_initialization=self.use_rfe_initialization,
                                    initial_subsets=self.initial_subsets, feature_names=list(self.feature_names_in_),
                                    feature_groups=self.feature_groups)
+        self.progress_.start_generations(self.optimization_.max_generations,
+                                         completed=state["generation"] if state else 0)
         try:
             result = self.engine_.run(checkpoint_callback=self._checkpoint, state=state, cancel=self._cancel.is_set)
         except (KeyboardInterrupt, InterruptedError):
@@ -2703,6 +2772,8 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         except Exception as error:
             self.progress_.error("Feature subset search failed; completed evaluations remain cached", phase="optimization", error_type=type(error).__name__, reason=str(error))
             raise
+        finally:
+            self.progress_.finish_generations()
         self._state = result["state"]
         self.confirmed_ = result["confirmed"]
         self.provisional_ = result["provisional"]
@@ -2719,13 +2790,13 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             if selected_id is not None and any(r["key"] == selected_id for r in self.confirmed_):
                 self._select(selected_id)
             else:
-                self.progress_.info("Manual selection awaits a confirmed candidate ID", phase="selection",
+                self.progress_.milestone("Manual selection awaits a confirmed candidate ID", phase="selection",
                                     candidates=len(self.confirmed_))
         else:
             self._select()
         self._export()
         self.save_checkpoint()
-        self.progress_.info("Feature selection completed", phase="complete", stop_reason=self.stop_reason_,
+        self.progress_.milestone("Feature selection completed", phase="complete", stop_reason=self.stop_reason_,
                             confirmed_pareto_candidates=len(self.confirmed_), selected_features=len(self.best_features_ or []),
                             elapsed_seconds=round(time.monotonic() - started, 3), log=str(self.log_path_))
         self.progress_.close()
@@ -2734,7 +2805,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
     def _select(self, candidate_id=None):
         self.selected_candidate_ = select_candidate(self.confirmed_, self.selection_, self.random_state, candidate_id)
         self.best_features_ = self.feature_names_in_[np.asarray(self.selected_candidate_["mask"], bool)].tolist()
-        self.progress_.info("Final candidate selected", phase="selection", policy=self.selection_.policy,
+        self.progress_.milestone("Final candidate selected", phase="selection", policy=self.selection_.policy,
                             features=len(self.best_features_), mean_gini=self.selected_candidate_["mean_gini"],
                             candidate=self.selected_candidate_["key"][:12])
 
@@ -2791,7 +2862,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             settings["verbose"] = verbose
         selector = cls(**settings, checkpoint_dir=directory)
         selector._settings()
-        selector.progress_.info("Checkpoint inputs and dependency versions verified", phase="resume", directory=str(directory))
+        selector.progress_.milestone("Checkpoint inputs and dependency versions verified", phase="resume", directory=str(directory))
         data = load_dataset(directory / "data")
         selector._set_features(data)
         selector.folds_ = [Fold(np.load(directory / f["train"], mmap_mode="r"),
@@ -2843,7 +2914,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
             raise ValueError("Select a candidate first")
         data = self.evaluator_.data
         started = time.monotonic()
-        self.progress_.info("Fitting final model on all development rows", phase="final_model", rows=len(data.y),
+        self.progress_.milestone("Fitting final model on all development rows", phase="final_model", rows=len(data.y),
                             features=len(self.best_features_), rounds=self.num_boost_round)
         cols = np.flatnonzero(self.get_support())
         cats = [i for i, col in enumerate(cols) if col in data.categorical_indices]
@@ -2862,7 +2933,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         self.final_model_.pandas_categorical = [data.categories[self.feature_names_in_[cols[i]]] for i in cats]
         self.final_model_.save_model(str(self.directory_ / "final_model.txt"))
         atomic_json(self.directory_ / "final_model_metadata.json", {"features": self.best_features_, "categories": data.categories, "parameters": params})
-        self.progress_.info("Final development model saved", phase="final_model", elapsed_seconds=round(time.monotonic() - started, 3))
+        self.progress_.milestone("Final development model saved", phase="final_model", elapsed_seconds=round(time.monotonic() - started, 3))
         self.progress_.close()
         return self.final_model_
 
@@ -2889,7 +2960,7 @@ class MemeticNSGA2Selector(TransformerMixin, BaseEstimator):
         chosen = self.selected_candidate_ or self.reference_
         self.temporal_performance_ = pd.DataFrame(chosen["folds"])
         self.segment_performance_ = pd.DataFrame(chosen["segments"])
-        self.progress_.info("Result artifacts saved", phase="reporting", directory=str(self.directory_))
+        self.progress_.milestone("Result artifacts saved", phase="reporting", directory=str(self.directory_))
 
 
 # === Source: memetic_fs/cli.py ===
@@ -2911,7 +2982,7 @@ def _check(values: dict, allowed: set[str], label: str):
     if unknown:
         raise ValueError(f"Unknown {label} keys: {sorted(unknown)}")
 
-def load_experiment(path: str | Path) -> tuple[dict, dict]:
+def load_experiment(path: str | Path, *, _validate: bool = True) -> tuple[dict, dict]:
     """Read strict YAML and map it onto the public Python constructor."""
     source = Path(path).resolve()
     config = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -2967,7 +3038,8 @@ def load_experiment(path: str | Path) -> tuple[dict, dict]:
               "verbose": output.get("verbose", 1),
               "output_format": output.get("format", "parquet"), **special}
     # Validate nested settings before loading a potentially huge dataset.
-    MemeticNSGA2Selector(**kwargs)._validate_options()
+    if _validate:
+        MemeticNSGA2Selector(**kwargs)._validate_options()
     return data, kwargs
 
 def main(argv: list[str] | None = None) -> int:
@@ -3041,7 +3113,7 @@ def load_selector_settings(path: str | Path) -> dict:
         raise ValueError("Selector YAML must be a mapping")
     if "data" in document or "model" in document or "output" in document:
         pass
-        _, settings = load_experiment(source)
+        _, settings = load_experiment(source, _validate=False)
         return settings
     pass
     allowed = set(inspect.signature(MemeticNSGA2Selector).parameters)
@@ -3313,6 +3385,8 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
     if depth not in {"quick", "standard", "deep"}:
         raise ValueError("depth must be 'quick', 'standard', or 'deep'")
     destination = Path(output_path).resolve()
+    if base_config is not None and destination == Path(base_config).resolve():
+        raise ValueError("output_path must differ from base_config so the source YAML stays unchanged")
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Warm-up YAML already exists: {destination}; use overwrite=True to replace it")
     baseline = cls.from_config(base_config) if base_config is not None else cls()
@@ -3734,8 +3808,12 @@ def segment_constraint_comparisons(payload: dict) -> list[dict]:
 
 def _base(figure: go.Figure, title: str, x: str = "", y: str = "") -> go.Figure:
     figure.update_layout(title=title, xaxis_title=x, yaxis_title=y, template="plotly_white",
-                         font={"family": "Arial, sans-serif", "size": 13}, height=490,
-                         margin={"l": 70, "r": 30, "t": 85, "b": 70})
+                         font={"family": "Segoe UI, sans-serif", "size": 13, "color": "#223943"},
+                         colorway=["#006F83", "#395DA8", "#9A6A28", "#755CA4", "#477B68"],
+                         paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF", height=490,
+                         margin={"l": 70, "r": 30, "t": 75, "b": 70})
+    figure.update_xaxes(gridcolor="#E3EAED", linecolor="#B7C8CE", zerolinecolor="#B7C8CE")
+    figure.update_yaxes(gridcolor="#E3EAED", linecolor="#B7C8CE", zerolinecolor="#B7C8CE")
     return figure
 
 
@@ -3845,19 +3923,103 @@ def build_figures(payload: dict, max_cofeatures: int = 30) -> dict[str, go.Figur
         evolution.add_trace(go.Scatter(x=generations, y=[h.get(key) for h in history], name=label), row=2, col=1)
     for key in ["feature_count_min", "feature_count_mean", "feature_count_max"]:
         evolution.add_trace(go.Scatter(x=generations, y=[h.get(key) for h in history], name=key.replace("_", " ")), row=3, col=1)
-    evolution.update_layout(height=920, title="Evolution history (convergence uses confirmed full-CV frontier)", template="plotly_white")
+    _base(evolution, "Evolution history (convergence uses confirmed full-CV frontier)")
+    evolution.update_layout(height=920)
     evolution.update_xaxes(title_text="Generation", row=3, col=1)
     figures["history"] = evolution
     return figures
+
+
+_REPORT_CSS = """
+:root{color-scheme:light;--ink:#17313d;--muted:#516873;--paper:#eef3f4;--white:#fff;
+  --line:#d4e0e4;--signal:#006f83;--deep:#102c39;--alert:#9b3e2c}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);
+  color:var(--ink);font:16px/1.55 'Segoe UI',Arial,sans-serif}
+a{color:var(--signal)}a:focus-visible{outline:3px solid #e4ad4b;outline-offset:3px}
+.skip-link{position:absolute;top:-4rem;left:1rem;z-index:10;background:#fff;padding:.5rem 1rem}
+.skip-link:focus{top:1rem}.masthead{background:var(--deep);color:#f4f8f9;
+  border-bottom:6px solid var(--signal)}.wrap{max-width:1296px;margin:auto;padding-left:clamp(20px,4vw,56px);
+  padding-right:clamp(20px,4vw,56px)}.masthead .wrap{padding-top:42px;padding-bottom:42px}
+.identity{font:600 .85rem/1.2 Bahnschrift,'Arial Narrow',Arial,sans-serif;color:#a9c9d1;
+  letter-spacing:.02em;margin:0 0 24px}.masthead h1{font:600 clamp(2.3rem,4.4vw,4.3rem)/1.03
+  Bahnschrift,'Arial Narrow',Arial,sans-serif;letter-spacing:-.035em;max-width:24ch;margin:0 0 18px}
+.masthead p{max-width:70ch;color:#c6d8de;margin:0}.overview{background:var(--white);
+  border-bottom:1px solid var(--line)}.overview .wrap{display:grid;grid-template-columns:minmax(0,1.3fr)
+  minmax(300px,.8fr);gap:clamp(24px,4vw,60px);padding-top:34px;padding-bottom:34px}
+.overview h2{font:600 1.45rem/1.2 Bahnschrift,'Arial Narrow',Arial,sans-serif;margin:0 0 12px}
+.overview p{max-width:70ch;margin:0 0 12px}.overview .caution{font-size:.91rem;color:var(--muted)}
+.comparison{border-collapse:collapse;width:100%;font-size:.89rem;align-self:start}
+.comparison caption{font-weight:650;text-align:left;padding:0 0 10px;color:var(--ink)}
+.comparison th,.comparison td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:right}
+.comparison th:first-child,.comparison td:first-child{text-align:left;padding-left:0}
+.comparison thead th{font-weight:600;color:var(--muted);white-space:nowrap}
+.comparison tbody th{font-weight:500;color:var(--muted)}.comparison td{font-variant-numeric:tabular-nums}
+.contents{background:#e3ebee;border-bottom:1px solid #c8d7dc}.contents .wrap{display:flex;
+  flex-wrap:wrap;gap:2px 22px;align-items:center;padding-top:11px;padding-bottom:11px}
+.contents strong{font:600 .82rem Bahnschrift,'Arial Narrow',Arial,sans-serif;color:#526873;
+  margin-right:3px}.contents a{text-decoration:none;font-size:.86rem;font-weight:600;padding:5px 0}
+.contents a:hover{text-decoration:underline}main.wrap{padding-top:28px;padding-bottom:70px}
+.report-section{scroll-margin-top:20px;background:var(--white);border:1px solid var(--line);
+  margin:0 0 20px;padding:clamp(18px,2.3vw,32px)}.report-section.primary{border-top:5px solid var(--signal)}
+.section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
+  border-bottom:1px solid var(--line);padding-bottom:13px;margin-bottom:12px}
+.section-heading h2{font:600 clamp(1.35rem,2vw,1.8rem)/1.2 Bahnschrift,'Arial Narrow',Arial,sans-serif;
+  letter-spacing:-.015em;margin:0}.section-heading a{font-size:.8rem;white-space:nowrap}
+.section-intro{color:var(--muted);max-width:75ch;font-size:.92rem;margin:0 0 8px}
+.chart{min-width:0}.chart .js-plotly-plot{width:100%}.feature-list{list-style:none;margin:18px 0 0;
+  padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 18px}
+.feature-list li{border-bottom:1px solid var(--line);padding:8px 0;overflow-wrap:anywhere}
+.feature-list code,code{font: .9em/1.5 Consolas,'Courier New',monospace}
+.table-scroll{overflow:auto;max-height:540px;border:1px solid var(--line);margin-top:16px}
+.constraints{border-collapse:collapse;width:100%;font-size:.85rem;min-width:720px}
+.constraints th,.constraints td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left}
+.constraints thead th{position:sticky;top:0;background:#e8eff1;color:var(--ink);z-index:1}
+.constraints tbody tr:nth-child(even){background:#f7f9fa}.constraints tr.violation{background:#fcece9;color:var(--alert)}
+.constraints td:nth-child(n+4){font-variant-numeric:tabular-nums}
+.footer{color:var(--muted);font-size:.82rem;border-top:1px solid var(--line);padding-top:20px}
+@media(max-width:760px){.masthead .wrap{padding-top:29px;padding-bottom:29px}
+  .overview .wrap{grid-template-columns:1fr;gap:18px}.report-section{padding:16px}
+  .section-heading{align-items:flex-start}.feature-list{grid-template-columns:1fr 1fr}}
+@media(max-width:520px){.feature-list{grid-template-columns:1fr}.contents .wrap{gap:0 14px}
+  .comparison{font-size:.78rem}.comparison th,.comparison td{padding:7px 4px}
+  .section-heading h2{font-size:1.3rem}.section-heading a{display:none}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+@media print{body{background:#fff}.masthead{background:#fff;color:#000;border-color:#000}
+  .masthead p,.identity{color:#333}.contents,.section-heading a{display:none}
+  .report-section{break-inside:avoid;border-color:#bbb}.table-scroll{max-height:none;overflow:visible}}
+"""
 
 
 def write_report(path: str | Path, payload: dict) -> Path:
     """Write one fully self-contained Plotly HTML artifact, usable without internet."""
     path = Path(path)
     figures = build_figures(payload)
+    descriptions = {
+        "frontier": ("Observed Pareto frontier", "Each point is an evaluated subset. The teal line joins confirmed feasible solutions; the star is the full-feature reference."),
+        "cardinality": ("Performance by subset size", "Best observed full-validation Gini at each evaluated feature count. This is search evidence, not a complete sweep."),
+        "frequency": ("Features in strong subsets", f"Inclusion frequency across distinct confirmed Pareto subsets within {payload.get('gini_tolerance', 0.005):g} Gini of the best observed result."),
+        "coselection": ("Feature co-selection", "How often two features appear together in the confirmed Pareto set."),
+        "temporal": ("Validation over time", "Fold-level Gini for the selected model, best confirmed result, reference, and other frontier subsets."),
+        "segments": ("Segment performance", "Equal-fold mean Gini by segment. Any configured hard floors are checked per fold in the table below."),
+        "history": ("Search history", "Confirmed frontier progress, evaluation counts, and population size across generations."),
+    }
     sections = []
     for name, figure in figures.items():
-        sections.append(f'<section id="{escape(name)}">{figure.to_html(full_html=False, include_plotlyjs=False, div_id="chart-" + name)}</section>')
+        heading, description = descriptions[name]
+        figure.update_layout(title=None, margin={"t": 35})
+        chart = figure.to_html(full_html=False, include_plotlyjs=False, div_id="chart-" + name,
+                               config={"responsive": True, "displaylogo": False})
+        sections.append(f'<section class="report-section{" primary" if name == "frontier" else ""}" id="{name}">'
+                        f'<div class="section-heading"><h2>{heading}</h2><a href="#top">Back to top</a></div>'
+                        f'<p class="section-intro">{description}</p><div class="chart">{chart}</div></section>')
+        if name == "frontier":
+            feature_items = ''.join(f'<li><code>{escape(str(feature))}</code></li>' for feature in payload['best_features'])
+            feature_body = (f'<ul class="feature-list">{feature_items}</ul>' if feature_items else
+                            '<p>No features were selected in this saved result.</p>')
+            sections.append('<section class="report-section" id="selected-features">'
+                            '<div class="section-heading"><h2>Selected features</h2><a href="#top">Back to top</a></div>'
+                            '<p class="section-intro">The feature set designated by this run for external validation.</p>'
+                            f'{feature_body}</section>')
     constraints = segment_constraint_comparisons(payload)
     if constraints:
         selected_mask = [name in payload["best_features"] for name in payload["feature_names"]]
@@ -3877,26 +4039,76 @@ def write_report(path: str | Path, payload: dict) -> Path:
                       "VIOLATION" if row["violated"] else ("UNDEFINED" if row["violated"] is None else "Pass")]
             cells = "".join(f"<td>{escape(f'{value:.5f}' if isinstance(value, float) else str(value))}</td>" for value in values)
             table_rows.append(f'<tr class="{"violation" if row["violated"] else ""}">{cells}</tr>')
-        sections.append('<section id="constraint-table"><h2>Per-fold segment constraints</h2>'
-                        f'<p>{len(violations)} violated full-CV comparisons. Selected, best and reference comparisons are shown, '
-                        'followed by up to 500 other violations. Complete comparisons, support counts and explicit fidelity tags '
-                        f'are available in <code>segment_constraints.{payload.get("output_format", "parquet")}</code>.</p>'
-                        '<div style="overflow:auto"><table><thead><tr>' + ''.join(f'<th>{h}</th>' for h in headings) +
-                        '</tr></thead><tbody>' + ''.join(table_rows) + '</tbody></table></div></section>')
+        constraint_body = (f'<p class="section-intro">{len(violations)} violated full-CV comparisons. Selected, best and reference comparisons are shown, '
+                           'followed by up to 500 other violations. Complete comparisons, support counts and fidelity tags '
+                           f'are in <code>segment_constraints.{escape(str(payload.get("output_format", "parquet")))}</code>.</p>'
+                           '<div class="table-scroll"><table class="constraints"><thead><tr>' +
+                           ''.join(f'<th scope="col">{h}</th>' for h in headings) +
+                           '</tr></thead><tbody>' + ''.join(table_rows) + '</tbody></table></div>')
     else:
-        sections.append('<section id="constraint-table"><h2>Per-fold segment constraints</h2><p>No active segment hard constraints were configured. '
-                        'Any exclusions for insufficient event support are recorded in the experiment manifest.</p></section>')
+        constraint_body = ('<p class="section-intro">No active segment hard constraints were configured. '
+                           'Any exclusions for insufficient event support are recorded in the experiment manifest.</p>')
+    sections.append('<section class="report-section" id="constraint-table">'
+                    '<div class="section-heading"><h2>Per-fold segment constraints</h2><a href="#top">Back to top</a></div>'
+                    f'{constraint_body}</section>')
+
+    names = payload["feature_names"]
+    selected_mask = [name in payload["best_features"] for name in names]
+    candidates = [r for r in payload["results"] if r["fidelity"] == "full"]
+    selected_id = payload.get("selected_candidate_id")
+    selected = next((r for r in candidates if r["key"] == selected_id), None) if selected_id else None
+    if selected is None:
+        selected = next((r for r in candidates if r["mask"] == selected_mask), None)
+    reference = payload["reference"]
+    def gini(result: dict | None) -> str:
+        value = result.get("mean_gini") if result else None
+        return f"{value:.4f}" if isinstance(value, (int, float)) else "—"
+
     converged = any(row.get("converged", False) for row in payload.get("history", []))
+    links = [("frontier", "Frontier"), ("selected-features", "Selected features"),
+             ("cardinality", "Subset size"), ("frequency", "Frequency"),
+             ("coselection", "Co-selection"), ("temporal", "Over time"),
+             ("segments", "Segments"), ("history", "Search history"),
+             ("constraint-table", "Constraints")]
+    navigation = ''.join(f'<a href="#{target}">{label}</a>' for target, label in links)
     text = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Memetic feature selection experiment</title><style>body{{margin:0;background:#f4f6f8;color:#182934;font:16px Arial,sans-serif}}main{{max-width:1250px;margin:auto;padding:32px}}section{{background:white;margin:24px 0;border-radius:8px;padding:12px}}p{{line-height:1.6}}nav a{{margin-right:16px;color:#007c91}}code{{font-size:13px}}table{{border-collapse:collapse;width:100%;font-size:13px}}td,th{{text-align:left;padding:9px;border-bottom:1px solid #d8e0e5}}tr.violation{{background:#fff0ef;color:#9b2525}}th{{background:#edf3f6}}</style>
-<script>{get_plotlyjs()}</script></head><body><main><h1>Feature subset selection</h1>
-<p>Development temporal validation. {len(payload['pareto'])} confirmed Pareto subsets; {len(payload['best_features'])} selected features.
-Numerical convergence observed: {str(converged).lower()}.</p>
-<p>These charts describe evaluated subsets. They do not establish a global optimum. Repeated search creates selection optimism;
-an independent external OOT assessment remains necessary. Provisional fold-reduced measurements have a separate evaluation basis.
-Frequency and co-selection describe searched solution families, not statistical feature significance.</p>
-<nav>{''.join(f'<a href="#{name}">{name.capitalize()}</a>' for name in figures)}</nav>
-{''.join(sections)}<section><h2>Selected features</h2><p>{escape(', '.join(payload['best_features']))}</p></section></main></body></html>"""
+<title>Feature selection | Development validation report</title><style>{_REPORT_CSS}</style>
+<script>{get_plotlyjs()}</script></head><body id="top"><a class="skip-link" href="#report">Skip to report</a>
+<header class="masthead"><div class="wrap"><p class="identity">Memetic NSGA-II / experiment report</p>
+<h1>Feature selection under temporal validation</h1>
+<p>Observed trade-offs from the development search. {len(payload['pareto'])} confirmed Pareto subsets; numerical convergence {'observed' if converged else 'not observed'}.</p>
+</div></header><div class="overview"><div class="wrap"><div><h2>Read this result</h2>
+<p>The selected subset is a candidate for an independent external OOT assessment. These plots describe evaluated subsets and do not establish a global optimum.</p>
+<p class="caution">Repeated search creates selection optimism. Provisional fold-reduced measurements have a separate evaluation basis. Feature frequency and co-selection describe searched solution families, not statistical feature significance.</p></div>
+<table class="comparison"><caption>Selected versus full-feature reference</caption><thead><tr><th scope="col">Measure</th><th scope="col">Selected</th><th scope="col">Reference</th></tr></thead>
+<tbody><tr><th scope="row">Features</th><td>{len(payload['best_features'])} / {len(names)}</td><td>{reference['n_features']} / {len(names)}</td></tr>
+<tr><th scope="row">Mean validation Gini</th><td>{gini(selected)}</td><td>{gini(reference)}</td></tr>
+<tr><th scope="row">Evaluation</th><td>{'Full CV' if selected else 'Unavailable'}</td><td>Full CV</td></tr></tbody></table></div></div>
+<nav class="contents" aria-label="Report sections"><div class="wrap"><strong>Explore</strong>{navigation}</div></nav>
+<main class="wrap" id="report">{''.join(sections)}<p class="footer">Development validation evidence only. Review the saved tables and external OOT results before using a subset in production.</p></main>
+<script>
+(() => {{
+  const charts = ['frontier', 'cardinality', 'temporal', 'segments', 'history'];
+  const compact = matchMedia('(max-width: 640px)');
+  function arrangeCharts() {{
+    for (const name of charts) {{
+      const plot = document.getElementById('chart-' + name);
+      if (!plot || !plot.data) continue;
+      const small = compact.matches;
+      Plotly.relayout(plot, {{
+        legend: small ? {{orientation:'h', x:0, y:-0.26, font:{{size:11}}}} :
+                        {{orientation:'v', x:1.02, y:1, font:{{size:12}}}},
+        margin: small ? {{l:55, r:12, t:25, b:name === 'history' ? 210 : 130}} :
+                        {{l:70, r:30, t:35, b:70}}
+      }});
+    }}
+    const frequency = document.getElementById('chart-frequency');
+    if (frequency && frequency.data) Plotly.relayout(frequency, {{showlegend:!compact.matches}});
+  }}
+  arrangeCharts();
+  compact.addEventListener('change', arrangeCharts);
+}})();
+</script></body></html>"""
     path.write_text(text, encoding="utf-8")
     return path.resolve()
 

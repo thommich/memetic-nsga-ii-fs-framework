@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import as_completed
 from typing import Callable, Iterable, TypeVar
 
 from joblib.externals.loky import get_reusable_executor
@@ -70,9 +71,15 @@ class ResourceScheduler:
                                threads_per_worker=plan.threads_per_worker, completed_tasks=cursor,
                                total_tasks=len(task_list), memory_budget_bytes=plan.memory_budget_bytes,
                                estimated_task_bytes=plan.estimated_task_bytes)
+            self.progress.worker_status(total=len(batch), running=len(batch), completed=0, failed=0)
             try:
                 if workers == 1:
-                    batch_results = [_limited_call(fn, task, plan.threads_per_worker) for task in batch]
+                    try:
+                        batch_results = [_limited_call(fn, batch[0], plan.threads_per_worker)]
+                    except BaseException:
+                        self.progress.worker_status(total=1, running=0, completed=0, failed=1)
+                        raise
+                    self.progress.worker_status(total=1, running=0, completed=1, failed=0)
                 else:
                     # Descriptors contain paths, not matrices. Using loky
                     # directly avoids creating redundant joblib temporary
@@ -83,17 +90,23 @@ class ResourceScheduler:
                                     "NUMEXPR_NUM_THREADS")}
                     executor = get_reusable_executor(max_workers=workers, timeout=300, env=environment)
                     futures = [executor.submit(_limited_call, fn, task, plan.threads_per_worker) for task in batch]
-                    batch_results, errors = [], []
+                    batch_results, errors = [None] * len(futures), []
+                    completed, failed = 0, 0
                     try:
                         # Drain the bounded batch before retrying: surviving
                         # workers can commit their completed cache records.
                         with progress_activity(self.progress, "Model batch still running", workers=workers,
                                                completed_tasks=cursor, total_tasks=len(task_list)):
-                            for future in futures:
+                            positions = {future: index for index, future in enumerate(futures)}
+                            for future in as_completed(futures):
                                 try:
-                                    batch_results.append(future.result())
+                                    batch_results[positions[future]] = future.result()
+                                    completed += 1
                                 except Exception as error:
                                     errors.append(error)
+                                    failed += 1
+                                self.progress.worker_status(total=len(batch),
+                                    running=len(batch)-completed-failed, completed=completed, failed=failed)
                         if errors:
                             raise errors[0]
                     except BaseException:

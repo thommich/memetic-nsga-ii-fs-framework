@@ -4,6 +4,9 @@ The resource manager uses currently available host RAM, effective cgroup v1/v2
 memory limits and usage, CPU affinity and CPU quotas. It reserves 25% of effective
 capacity by default. `max_ram_gb`, `max_workers` and `threads_per_worker` impose
 additional bounds. Memory already consumed by other applications is unavailable.
+Warm-up may suggest worker and thread caps from a resource snapshot and pilot
+memory measurements. These suggestions are environment-dependent; the later
+run still checks live headroom at each worker-admission boundary.
 USS measures private process allocations; PSS, then RSS are fallbacks where the
 platform does not expose USS. Host/cgroup availability accounts for shared mapped
 pages once, rather than summing every worker's RSS.

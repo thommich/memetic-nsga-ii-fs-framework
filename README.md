@@ -28,8 +28,9 @@ from memetic_fs_standalone import MemeticNSGA2Selector
 selector = MemeticNSGA2Selector.resume("./runs/risk_selection")
 ```
 
-The standalone file contains the same implementation and reporting code as the
-package. It writes its data copy, cache, checkpoints, logs and reports under
+The standalone file also exposes `MemeticNSGA2Selector.warmup_settings_params()`
+and `MemeticNSGA2Selector.from_config()` for notebook workflows. It writes its
+data copy, cache, checkpoints, logs and reports under
 `checkpoint_dir`. To refresh it after editing package sources, run
 `python tools/build_standalone.py`.
 
@@ -113,8 +114,10 @@ memetic-fs report --experiment-dir runs/example
 All relative YAML paths resolve from the configuration file's directory. See
 [the complete example](examples/experiment.yaml), [configuration guide](docs/configuration.md),
 and [Python API parameter reference](docs/api-parameters.md).
-An executed, standalone [synthetic notebook](examples/complete_pipeline.ipynb)
-demonstrates the pipeline. Self-contained Plotly output lives in `report.html`.
+The [complete synthetic notebook](examples/complete_pipeline.ipynb)
+demonstrates warm-up through checkpoint recovery. Its saved outputs were cleared
+after the API update; run its cells in order to generate current results.
+Self-contained Plotly output lives in `report.html`.
 
 The default policy chooses the smallest feasible confirmed model within 0.005
 absolute Gini of the best confirmed candidate. `selector.select('knee')`,

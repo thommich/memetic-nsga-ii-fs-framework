@@ -14,6 +14,13 @@ with `libgomp.so.1`, install the distribution's OpenMP runtime through the
 instance administrator or the image build. Confirm binary wheels are available
 for the Python/architecture in use before starting a long experiment.
 
+For notebook-driven runs, optional `warmup_settings_params()` can inspect the
+development data and instance resources before the search. Its `standard` and
+`deep` levels run full-row LightGBM pilots and can take substantial time on a
+large instance dataset. Review the separate YAML, then load it with
+`MemeticNSGA2Selector.from_config()`; rerun warm-up after changing instance type
+if you intend to use its worker and thread suggestions.
+
 Use a durable local EBS experiment directory with adequate free disk. The run
 stores a full NPY data copy, folds, SQLite WAL, compact results and JSON
 checkpoints. Read-only mmap reduces process transfer, but selected-column copies

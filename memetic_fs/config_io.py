@@ -15,7 +15,7 @@ def load_selector_settings(path: str | Path) -> dict:
         raise ValueError("Selector YAML must be a mapping")
     if "data" in document or "model" in document or "output" in document:
         from .cli import load_experiment
-        _, settings = load_experiment(source)
+        _, settings = load_experiment(source, _validate=False)
         return settings
     from .api import MemeticNSGA2Selector
     allowed = set(inspect.signature(MemeticNSGA2Selector).parameters)

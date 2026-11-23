@@ -121,6 +121,8 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
     if depth not in {"quick", "standard", "deep"}:
         raise ValueError("depth must be 'quick', 'standard', or 'deep'")
     destination = Path(output_path).resolve()
+    if base_config is not None and destination == Path(base_config).resolve():
+        raise ValueError("output_path must differ from base_config so the source YAML stays unchanged")
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Warm-up YAML already exists: {destination}; use overwrite=True to replace it")
     baseline = cls.from_config(base_config) if base_config is not None else cls()

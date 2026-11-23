@@ -217,18 +217,18 @@ class SearchEngine:
     def run(self, checkpoint_callback: Callable | None = None, state=None, cancel=None):
         """Execute until confirmed-front convergence, safety limit, or cancellation."""
         self._run_started = time.perf_counter()
-        self.progress.info("Optimization started", max_generations=self.config.max_generations,
+        self.progress.milestone("Optimization started", max_generations=self.config.max_generations,
                            population_size=self.config.population_size, candidate_features=self.n_features,
                            min_features=self.bounds[0], max_features=self.bounds[1],
                            resuming=state is not None)
         if state is not None:
             self._restore(state)
-            self.progress.info("Optimization checkpoint restored", completed_generation=state["generation"],
+            self.progress.milestone("Optimization checkpoint restored", completed_generation=state["generation"],
                                population_size=len(self.algorithm.pop), fidelity=state["fidelity"],
                                completed_evaluations=len(self.results),
                                confirmed_count=len(self._front("full")))
             if state.get("stop_reason") in {"pareto_convergence", "search_space_exhausted"}:
-                self.progress.info("Optimization already completed; retaining checkpoint result",
+                self.progress.milestone("Optimization already completed; retaining checkpoint result",
                                    reason=state["stop_reason"], completed_generation=state["generation"])
                 return self._result(state["stop_reason"])
             start = state["generation"] + 1
@@ -251,7 +251,7 @@ class SearchEngine:
             sampling = initial_population(self.n_features, self.bounds, self.config.population_size,
                 self.rng, self.config, self.evaluator.reference["importance"], self.user_seeds, rfe, self.groups)
             cardinalities = sampling.sum(axis=1)
-            self.progress.info("Initial population prepared", user_seeds=len(self.user_seeds),
+            self.progress.milestone("Population initialization completed", user_seeds=len(self.user_seeds),
                                rfe_seeds=len(rfe), unique_candidates=len(sampling),
                                min_features=int(cardinalities.min()), mean_features=float(cardinalities.mean()),
                                max_features=int(cardinalities.max()))
@@ -274,9 +274,11 @@ class SearchEngine:
                     break
                 fidelity = f"last_{self.config.reduced_fold_count}" if generation <= self.config.reduced_generations else "full"
                 generation_started = time.perf_counter()
+                self.progress.generation(generation)
                 self.progress.info("Generation started", generation=generation,
                                    max_generations=self.config.max_generations, fidelity=fidelity,
                                    phase="initial_population" if not self.algorithm.is_initialized else "offspring")
+                self.progress.milestone(f"Running generation {generation}", fidelity=fidelity)
                 self.problem.fidelity = fidelity
                 if previous_fidelity is not None and previous_fidelity != fidelity:
                     # Existing parents and new offspring must share one fitness basis.
@@ -316,7 +318,7 @@ class SearchEngine:
                 if generation >= self.config.min_generations and stalled >= self.config.patience:
                     stop_reason = "pareto_convergence"
                     self.history[-1]["converged"] = True
-                    self.progress.info("Confirmed Pareto frontier converged", generation=generation,
+                    self.progress.milestone("Confirmed Pareto frontier converged", generation=generation,
                                        stalled_generations=stalled, patience=self.config.patience,
                                        minimum_improvement=self.config.min_improvement,
                                        confirmed_hypervolume=hypervolume)
@@ -329,6 +331,10 @@ class SearchEngine:
                                    max_features=int(counts.max()), stalled_generations=stalled,
                                    generation_seconds=time.perf_counter()-generation_started,
                                    elapsed_seconds=time.perf_counter()-self._run_started)
+                self.progress.generation_completed(generation)
+                self.progress.milestone(f"Generation {generation} completed",
+                                        best_confirmed_gini=self.history[-1]["best_confirmed_gini"],
+                                        confirmed_hypervolume=hypervolume)
                 checkpoint_reason = "running" if stop_reason == "max_generations" and generation < self.config.max_generations else stop_reason
                 self.last_state = self._serialize(generation, best_hv, stalled, fidelity, checkpoint_reason)
                 if checkpoint_callback:
@@ -356,7 +362,7 @@ class SearchEngine:
             raise
         if self.algorithm.pop is not None and len(self.algorithm.pop):
             # Always confirm every survivor, including infeasible provisional candidates.
-            self.progress.info("Final population confirmation started", candidates=len(self.algorithm.pop),
+            self.progress.milestone("Final population confirmation started", candidates=len(self.algorithm.pop),
                                fidelity="full")
             self._evaluate(self.algorithm.pop.get("X"), "full")
             self._confirm(fidelity)
@@ -373,7 +379,7 @@ class SearchEngine:
 
     def _result(self, stop_reason):
         front = self._front("full")
-        self.progress.info("Optimization completed", reason=stop_reason,
+        self.progress.milestone("Optimization completed", reason=stop_reason,
                            completed_generation=self.last_state["generation"] if self.last_state else 0,
                            confirmed_count=len(front), unique_evaluations=len(self.results),
                            best_confirmed_gini=max((result["mean_gini"] for result in front),default=None),

@@ -6,6 +6,10 @@ columns. The two search objectives are **negative mean validation Gini** and
 **selected feature count**; segment constraints, when supplied, restrict which
 subsets are feasible.
 
+An optional Python warm-up can precede this flow. It proposes settings in a
+separate YAML; `from_config()` loads the chosen YAML and applies inline
+overrides before `fit()` begins at step 1.
+
 ```mermaid
 flowchart TD
     A["1. Read settings and validate development data"] --> B["2. Build complete chronological CV folds"]

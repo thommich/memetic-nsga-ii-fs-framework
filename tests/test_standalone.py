@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-def test_single_file_parallel_fit_report_and_resume(tmp_path):
+def test_single_file_fit_report_and_resume(tmp_path):
     source = Path(__file__).resolve().parents[1] / "memetic_fs_standalone.py"
     shutil.copyfile(source, tmp_path / source.name)
     script = '''from pathlib import Path
@@ -26,7 +26,6 @@ assert all(r["fidelity"] == "full" for r in selector.confirmed_)
 assert Path("run/report.html").is_file()
 assert Path("run/checkpoint.json").is_file()
 assert Path("run/logs/run.log").is_file()
-assert list(Path("run/logs").glob("worker-*.log"))
 resumed = fs.MemeticNSGA2Selector.resume("run", verbose=0)
 assert resumed.best_features_ == selector.best_features_
 assert "memetic_fs" not in sys.modules

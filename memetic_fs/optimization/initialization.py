@@ -37,7 +37,7 @@ def rfe_seeds(evaluator, n_features, bounds, sizes):
     seeds, trajectory = [], []
     progress = get_progress(evaluator)
     started = time.perf_counter()
-    progress.info("RFE initialization started", targets=targets, initial_features=n_features)
+    progress.milestone("RFE initialization started", targets=targets, initial_features=n_features)
     for target in targets:
         progress.info("RFE target started", target_features=target, current_features=int(current.sum()))
         while current.sum() > target:
@@ -59,7 +59,7 @@ def rfe_seeds(evaluator, n_features, bounds, sizes):
         if not trajectory or trajectory[-1]["mask"] != evaluation["mask"]:
             trajectory.append(evaluation)
         progress.info("RFE target completed", target_features=target, mean_gini=evaluation["mean_gini"])
-    progress.info("RFE initialization completed", seeds=len(seeds), evaluation_steps=len(trajectory),
+    progress.milestone("RFE initialization completed", seeds=len(seeds), evaluation_steps=len(trajectory),
                   elapsed_seconds=time.perf_counter()-started)
     return seeds, trajectory
 

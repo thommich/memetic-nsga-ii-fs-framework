@@ -16,7 +16,7 @@ def _check(values: dict, allowed: set[str], label: str):
     if unknown:
         raise ValueError(f"Unknown {label} keys: {sorted(unknown)}")
 
-def load_experiment(path: str | Path) -> tuple[dict, dict]:
+def load_experiment(path: str | Path, *, _validate: bool = True) -> tuple[dict, dict]:
     """Read strict YAML and map it onto the public Python constructor."""
     source = Path(path).resolve()
     config = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -72,7 +72,8 @@ def load_experiment(path: str | Path) -> tuple[dict, dict]:
               "verbose": output.get("verbose", 1),
               "output_format": output.get("format", "parquet"), **special}
     # Validate nested settings before loading a potentially huge dataset.
-    MemeticNSGA2Selector(**kwargs)._validate_options()
+    if _validate:
+        MemeticNSGA2Selector(**kwargs)._validate_options()
     return data, kwargs
 
 def main(argv: list[str] | None = None) -> int:

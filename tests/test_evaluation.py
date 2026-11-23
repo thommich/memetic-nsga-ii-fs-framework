@@ -345,6 +345,9 @@ def test_evaluator_reports_fold_cache_and_duplicate_progress(inputs, tmp_path, m
             self.events = []
         def info(self, message, **fields):
             self.events.append(("info", message, fields))
+        milestone = info
+        def worker_status(self, **fields):
+            self.events.append(("workers", "Worker status", fields))
         def debug(self, message, **fields):
             self.events.append(("debug", message, fields))
         def warning(self, message, **fields):
@@ -383,8 +386,11 @@ def test_parallel_workers_write_separate_progress_files(inputs, tmp_path):
                           num_boost_round=3, config=EvaluationConfig(min_segment_events=3, min_segment_nonevents=3),
                           resources=ResourceConfig(max_workers=2, threads_per_worker=1), progress=reporter)
     evaluator.evaluate_many([[1, 0, 0], [0, 1, 0]])
-    assert "Evaluation batch prepared" in (directory / "logs" / "run.log").read_text()
+    run_log = (directory / "logs" / "run.log").read_text()
+    assert "Evaluation batch prepared" in run_log
     workers = list((directory / "logs").glob("worker-*.log"))
+    if not workers and "workers=2" not in run_log:
+        pytest.skip("Available memory admitted only one worker")
     assert workers
     assert all(path.name != f"worker-{os.getpid()}.log" for path in workers)
     details = "\n".join(path.read_text() for path in workers)
