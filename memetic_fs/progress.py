@@ -47,7 +47,8 @@ class ProgressReporter:
     when the application has not configured logging already.
     """
 
-    def __init__(self, directory: str | Path, verbose: int = 1, parent_pid: int | None = None):
+    def __init__(self, directory: str | Path, verbose: int = 1, parent_pid: int | None = None,
+                 log_name: str = "run.log"):
         if not isinstance(verbose, int) or isinstance(verbose, bool) or verbose not in (0, 1, 2):
             raise ValueError("verbose must be 0 (quiet), 1 (progress), or 2 (detailed)")
         self.directory = Path(directory).resolve()
@@ -58,8 +59,8 @@ class ProgressReporter:
         logs = self.directory / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         process = os.getpid()
-        self.path = logs / ("run.log" if process == self.parent_pid else f"worker-{process}.log")
-        identity = hashlib.sha256(str(self.directory).encode()).hexdigest()[:12]
+        self.path = logs / (log_name if process == self.parent_pid else f"worker-{process}.log")
+        identity = hashlib.sha256(str(self.path).encode()).hexdigest()[:12]
         self.logger = logging.getLogger(f"memetic_fs.progress.{identity}.{self.parent_pid}.{process}")
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = True

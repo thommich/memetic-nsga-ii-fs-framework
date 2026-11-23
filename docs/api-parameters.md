@@ -70,6 +70,7 @@ fit-count cutoff within a selected depth. `quick` model suggestions are
 heuristic. For a YAML warm-up, `time_cv` must be a column name. An existing
 `output_path` raises unless `overwrite=True`, and `output_path` cannot equal
 `base_config`.
+The result also exposes `log_path` for the warm-up's timestamped progress log.
 
 `MemeticNSGA2Selector.from_config(path, **overrides)` loads either a flat
 selector-settings YAML or a full CLI experiment YAML. Inline overrides take

@@ -12,6 +12,11 @@ selector = MemeticNSGA2Selector(
 )
 selector.fit(df, "target", id_col="applicant_id")
 print(selector.log_path_)
+
+warmup = MemeticNSGA2Selector.warmup_settings_params(
+    df, "target", output_path="settings/warmup.yaml", id_col="applicant_id"
+)
+print(warmup.log_path)  # settings/logs/warmup.log
 ```
 
 `verbose=0` limits the built-in console to warnings and errors. `verbose=1`
@@ -22,6 +27,16 @@ running, completed and failed worker tasks. `verbose=2` prints routine batch,
 fold, candidate, cache, checkpoint and heartbeat messages as well. All those
 messages are retained in the experiment log files at every verbosity. Timestamps
 are explicitly UTC (`Z`); durations are elapsed seconds.
+
+Warm-up uses the resolved selector's `verbose` setting from `base_config` (or
+the default of `1`). It logs data and fold validation, the planned fit count,
+resource planning, each model candidate and subset size, the chosen model,
+and the saved YAML. Individual pilot fits and their scores are in the log at
+every verbosity and appear on screen at `verbose=2`. A fit running longer
+than 30 seconds writes heartbeat entries. Warm-up failures are logged before
+the file is closed. Its log is `OUTPUT_PARENT/logs/OUTPUT_STEM.log`, separate
+from the later search's `run.log`; rerunning with `overwrite=True` appends to
+the existing warm-up log.
 
 The detailed log file's generation summary includes the generation and fidelity, best confirmed
 Gini, confirmed hypervolume, frontier size, evaluation count, feature-count

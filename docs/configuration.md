@@ -10,7 +10,7 @@ same metadata arguments used by `fit`. `base_config` may name an existing
 selector-settings or full experiment YAML. The source is never edited; the
 new YAML contains the proposed active values and requires an unused path unless
 `overwrite=True`. The returned `WarmupResult` includes diagnostics, chronological
-pilot scores, reasons, changes, warnings, and `settings_path`. Model pilots
+pilot scores, reasons, changes, warnings, `settings_path`, and `log_path`. Model pilots
 fit complete training and validation folds; their chosen settings remain
 recommendations rather than a promise about final feature count.
 
