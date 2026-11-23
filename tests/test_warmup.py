@@ -28,6 +28,11 @@ def test_quick_writes_separate_yaml_and_merges_inline_overrides(tmp_path, frame)
     original = source.read_bytes()
     result = warm(frame, tmp_path / "recommended.yaml", depth="quick", base_config=source)
     assert isinstance(result, WarmupResult)
+    assert result.log_path == tmp_path / "logs" / "recommended.log"
+    log = result.log_path.read_text(encoding="utf-8")
+    assert "Warm-up pilot planned" in log and 'planned_fits=0' in log
+    assert "Warm-up quick heuristics prepared" in log
+    assert "Warm-up settings saved" in log
     assert source.read_bytes() == original
     with pytest.raises(ValueError, match="must differ"):
         warm(frame, source, depth="quick", base_config=source, overwrite=True)
@@ -49,6 +54,8 @@ def test_quick_writes_separate_yaml_and_merges_inline_overrides(tmp_path, frame)
     assert selector.optimization_.population_size == 6  # configuration is resolved once
     with pytest.raises(FileExistsError):
         warm(frame, result.settings_path, depth="quick")
+    warm(frame, result.settings_path, depth="quick", overwrite=True)
+    assert result.log_path.read_text(encoding="utf-8").count("Warm-up settings saved") == 2
 
 
 def test_standard_pilots_every_planned_fit_on_chronological_full_rows(tmp_path, frame, monkeypatch):
@@ -64,6 +71,10 @@ def test_standard_pilots_every_planned_fit_on_chronological_full_rows(tmp_path, 
     monkeypatch.setattr(warmup, "_fit", checked_fit)
     result = warm(frame, tmp_path / "standard.yaml", depth="standard")
     assert len(seen) == result.diagnostics["planned_fits"]
+    log = result.log_path.read_text(encoding="utf-8")
+    assert log.count("Warm-up model fit completed") == len(result.pilots["model_candidates"]) * 3
+    assert log.count("Warm-up subset fit completed") == len(seen) - len(result.pilots["model_candidates"]) * 3
+    assert "Warm-up model selected" in log and "Warm-up settings saved" in log
     assert len(result.diagnostics["pilot_folds"]) == 3
     assert result.pilots["selected_model"]
     assert result.pilots["subset_score_gaps"]
@@ -84,6 +95,14 @@ def test_deep_uses_all_folds_and_complete_optimization_config(tmp_path, frame, m
     assert result.suggestions["optimization"]["rfe_seed_sizes"] == [
         r["n_features"] for r in result.pilots["subset_scores"]]
     assert "inverse_exponent" in result.suggestions["optimization"]
+
+
+def test_warmup_logs_failure_and_closes_file(tmp_path, frame):
+    path = tmp_path / "invalid.yaml"
+    with pytest.raises(ValueError):
+        warm(frame, path, depth="quick", time_cv="missing_month")
+    assert "Warm-up failed" in (tmp_path / "logs" / "invalid.log").read_text(encoding="utf-8")
+    assert not path.exists()
 
 
 def test_from_config_accepts_existing_experiment_yaml_without_creating_run(tmp_path):

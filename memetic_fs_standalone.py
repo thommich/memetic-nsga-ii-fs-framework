@@ -880,7 +880,8 @@ class ProgressReporter:
     when the application has not configured logging already.
     """
 
-    def __init__(self, directory: str | Path, verbose: int = 1, parent_pid: int | None = None):
+    def __init__(self, directory: str | Path, verbose: int = 1, parent_pid: int | None = None,
+                 log_name: str = "run.log"):
         if not isinstance(verbose, int) or isinstance(verbose, bool) or verbose not in (0, 1, 2):
             raise ValueError("verbose must be 0 (quiet), 1 (progress), or 2 (detailed)")
         self.directory = Path(directory).resolve()
@@ -891,8 +892,8 @@ class ProgressReporter:
         logs = self.directory / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         process = os.getpid()
-        self.path = logs / ("run.log" if process == self.parent_pid else f"worker-{process}.log")
-        identity = hashlib.sha256(str(self.directory).encode()).hexdigest()[:12]
+        self.path = logs / (log_name if process == self.parent_pid else f"worker-{process}.log")
+        identity = hashlib.sha256(str(self.path).encode()).hexdigest()[:12]
         self.logger = logging.getLogger(f"memetic_fs.progress.{identity}.{self.parent_pid}.{process}")
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = True
@@ -3286,6 +3287,7 @@ import yaml
 
 
 
+
 @dataclass
 class WarmupResult:
     settings_path: Path
@@ -3295,6 +3297,7 @@ class WarmupResult:
     reasons: dict
     changes: dict
     warnings: list[str]
+    log_path: Path
 
 
 def _plain(value):
@@ -3395,6 +3398,28 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
     baseline._validate_options()
     if not isinstance(baseline.time_cv, str):
         raise ValueError("YAML warm-up requires a named time_cv column; callable CV cannot be saved in YAML")
+    progress = ProgressReporter(destination.parent, verbose=baseline.verbose,
+                                log_name=f"{destination.stem}.log")
+    try:
+        return _run_warmup(baseline, X, y, depth, destination, overwrite, id_col, segment_cols,
+                           time_values, ids, feature_names, progress)
+    except (KeyboardInterrupt, InterruptedError):
+        progress.warning("Warm-up interrupted", phase="warmup", depth=depth)
+        raise
+    except Exception as error:
+        progress.error("Warm-up failed", phase="warmup", depth=depth,
+                       error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        progress.close()
+
+
+def _run_warmup(baseline, X, y, depth, destination, overwrite, id_col, segment_cols,
+                time_values, ids, feature_names, progress):
+    started = time.monotonic()
+    progress.milestone("Warm-up started", phase="warmup", depth=depth,
+                       settings_path=str(destination))
+    progress.info("Validating development data", phase="warmup")
     settings = dict(baseline.get_params(deep=False))
     for key in ("cv_config", "optimization", "evaluation", "resources", "selection"):
         settings[key] = asdict(getattr(baseline, key + "_"))
@@ -3403,12 +3428,18 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
     original_settings = deepcopy(settings)
     data = prepare_data(X, y, baseline.time_cv, id_col, segment_cols,
                         baseline.allow_repeated_ids, time_values, ids, feature_names)
+    progress.milestone("Warm-up development data validated", phase="warmup",
+                       rows=data.n_rows, predictors=data.n_features,
+                       categorical_features=len(data.categorical_indices))
     for constraint in baseline.constraints_:
         if constraint.column not in data.segments:
             raise ValueError(f"Constraint column {constraint.column!r} must be in segment_cols")
     normalize_subsets(baseline.initial_subsets, data.feature_names, (1, data.n_features))
     folds = build_folds(data.months, data.y, baseline.cv_config_,
                         custom=baseline.time_cv if callable(baseline.time_cv) else None)
+    progress.info("Warm-up temporal folds validated", phase="warmup", folds=len(folds),
+                  training_rows=[len(f.train) for f in folds],
+                  validation_rows=[len(f.valid) for f in folds])
     selected_folds = [] if depth == "quick" else (folds[-3:] if depth == "standard" else folds)
     sizes = [] if depth == "quick" else _sizes(data.n_features, depth)
     candidates = [] if depth == "quick" else _candidates(depth, min(len(f.train) for f in selected_folds),
@@ -3417,11 +3448,16 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
     notice = (f"Warm-up depth={depth}: {fit_count} planned LightGBM fits on {data.n_rows} rows and "
               f"{data.n_features} predictors. Duration depends on data size and the selected depth; "
               "there is no time or fit-count cutoff.")
-    warnings.warn(notice, UserWarning, stacklevel=3)
+    warnings.warn(notice, UserWarning, stacklevel=4)
+    progress.milestone("Warm-up pilot planned", phase="warmup", depth=depth,
+                       planned_fits=fit_count, pilot_folds=[f.label for f in selected_folds],
+                       model_candidates=len(candidates), subset_sizes=sizes)
     messages = [notice]
     snapshot_estimate = max(64 * 1024**2, 3 * max(len(f.train) for f in folds) * data.n_features * data.X.dtype.itemsize)
     manager = ResourceManager(baseline.resources_, snapshot_estimate)
     plan = manager.plan()
+    progress.milestone("Warm-up resources planned", phase="warmup", workers=plan.workers,
+                       threads_per_worker=plan.threads_per_worker)
     if plan.workers < 1:
         raise MemoryError("Insufficient memory headroom for warm-up pilot or later full-feature fit")
     diagnostics = _diagnostics(data, folds, plan.snapshot)
@@ -3441,14 +3477,26 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
                                     "num_leaves": 31, "min_data_in_leaf": max(5, min(300, round(n_train / 500)))}
         settings["num_boost_round"] = 200
         messages.append("Quick model suggestions are heuristics and were not validated by pilot fits.")
+        progress.milestone("Warm-up quick heuristics prepared", phase="warmup")
     else:
         full_cols = np.arange(data.n_features)
         full_records = []
-        for candidate in candidates:
+        completed_fits = 0
+        for candidate_index, candidate in enumerate(candidates, start=1):
             fold_records, importances = [], []
             for fold in selected_folds:
-                record, importance = _fit(data, fold, full_cols, candidate, plan.threads_per_worker,
-                                          baseline.evaluation_.estimator_seed)
+                progress.debug("Warm-up model fit started", phase="warmup", candidate=candidate_index,
+                               fold=fold.label, n_features=data.n_features,
+                               completed_fits=completed_fits, planned_fits=fit_count)
+                with progress_activity(progress, "Warm-up model fit still running", phase="warmup",
+                                       candidate=candidate_index, fold=fold.label):
+                    record, importance = _fit(data, fold, full_cols, candidate, plan.threads_per_worker,
+                                              baseline.evaluation_.estimator_seed)
+                completed_fits += 1
+                progress.debug("Warm-up model fit completed", phase="warmup", candidate=candidate_index,
+                               fold=fold.label, n_features=data.n_features, gini=record["gini"],
+                               elapsed_seconds=record["elapsed_seconds"], completed_fits=completed_fits,
+                               planned_fits=fit_count)
                 fold_records.append(record)
                 importances.append(importance.tolist())
             summary = {"params": candidate["params"], "num_boost_round": candidate["num_boost_round"],
@@ -3456,6 +3504,10 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
                        "elapsed_seconds": float(sum(r["elapsed_seconds"] for r in fold_records))}
             pilots["model_candidates"].append(summary)
             full_records.append((summary, importances))
+            progress.milestone("Warm-up model candidate completed", phase="warmup",
+                               candidate=candidate_index, candidates=len(candidates),
+                               mean_gini=summary["mean_gini"], completed_fits=completed_fits,
+                               planned_fits=fit_count)
         best_mean = max(item[0]["mean_gini"] for item in full_records)
         close = [item for item in full_records if item[0]["mean_gini"] >= best_mean - .001]
         winner, rankings = min(close, key=lambda item: (
@@ -3465,6 +3517,8 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
         settings["num_boost_round"] = winner["num_boost_round"]
         pilots["selected_model"] = {"params": winner["params"],
                                     "num_boost_round": winner["num_boost_round"]}
+        progress.milestone("Warm-up model selected", phase="warmup", mean_gini=winner["mean_gini"],
+                           num_boost_round=winner["num_boost_round"], params=winner["params"])
         for size in sizes:
             records = []
             for fold, gains, full_record in zip(selected_folds, rankings, winner["folds"]):
@@ -3473,11 +3527,23 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
                 else:
                     # Every ranking comes from this fold's training-only full model.
                     columns = np.sort(np.argsort(-np.asarray(gains), kind="stable")[:size])
-                    record, _ = _fit(data, fold, columns, pilots["selected_model"], plan.threads_per_worker,
-                                     baseline.evaluation_.estimator_seed)
+                    progress.debug("Warm-up subset fit started", phase="warmup", fold=fold.label,
+                                   n_features=size, completed_fits=completed_fits, planned_fits=fit_count)
+                    with progress_activity(progress, "Warm-up subset fit still running", phase="warmup",
+                                           fold=fold.label, n_features=size):
+                        record, _ = _fit(data, fold, columns, pilots["selected_model"], plan.threads_per_worker,
+                                         baseline.evaluation_.estimator_seed)
+                    completed_fits += 1
+                    progress.debug("Warm-up subset fit completed", phase="warmup", fold=fold.label,
+                                   n_features=size, gini=record["gini"],
+                                   elapsed_seconds=record["elapsed_seconds"], completed_fits=completed_fits,
+                                   planned_fits=fit_count)
                 records.append(record)
             pilots["subset_scores"].append({"n_features": size,
                 "mean_gini": float(np.mean([r["gini"] for r in records])), "folds": records})
+            progress.milestone("Warm-up subset size completed", phase="warmup", n_features=size,
+                               mean_gini=pilots["subset_scores"][-1]["mean_gini"],
+                               completed_fits=completed_fits, planned_fits=fit_count)
         for smaller, larger in zip(pilots["subset_scores"], pilots["subset_scores"][1:]):
             pilots["subset_score_gaps"].append({"from": smaller["n_features"], "to": larger["n_features"],
                 "mean_gini_gain": larger["mean_gini"] - smaller["mean_gini"]})
@@ -3485,6 +3551,8 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
                             for item in pilots["model_candidates"] for r in item["folds"])
         manager.calibrate(observed_peak)
         plan = manager.plan()
+        progress.info("Warm-up resources calibrated", phase="warmup", observed_peak_bytes=observed_peak,
+                      workers=plan.workers, threads_per_worker=plan.threads_per_worker)
         if plan.workers < 1:
             raise MemoryError("Pilot memory measurement leaves insufficient headroom for a full-feature fit")
         if pilots["subset_scores"][0]["mean_gini"] >= max(r["mean_gini"] for r in pilots["subset_scores"]) - .001:
@@ -3514,7 +3582,7 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
         serialized = yaml.safe_dump(plain, sort_keys=False, allow_unicode=True)
     except yaml.YAMLError as error:
         raise ValueError("Selector settings cannot be represented safely in YAML") from error
-    cls(**plain)._validate_options()
+    type(baseline)(**plain)._validate_options()
     previous = _plain(original_settings)
     changes = {key: {"previous": previous.get(key), "proposed": value,
                      "reason": reasons.get(key, "Normalized and validated for the suggested selector YAML")}
@@ -3530,7 +3598,10 @@ def warmup_settings_params(cls, X, y, *, depth, output_path, base_config, overwr
             temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
-    return WarmupResult(destination, plain, diagnostics, pilots, reasons, changes, messages)
+    progress.milestone("Warm-up settings saved", phase="warmup", settings_path=str(destination),
+                       log_path=str(progress.path), planned_fits=fit_count,
+                       elapsed_seconds=round(time.monotonic() - started, 3))
+    return WarmupResult(destination, plain, diagnostics, pilots, reasons, changes, messages, progress.path)
 
 
 # === Source: memetic_fs/reporting/exports.py ===
